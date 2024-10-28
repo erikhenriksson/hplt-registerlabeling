@@ -37,66 +37,6 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
-def estimate_lines_in_zst(file_path, sample_size=100 * 1024 * 1024):  # 100MB sample
-    """Estimate total lines by sampling the file"""
-    total_size = os.path.getsize(file_path)
-
-    # Read a sample of the compressed file
-    with open(file_path, "rb") as f:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(f) as reader:
-            # Read first chunk to get compression ratio
-            sample = reader.read(sample_size)
-            sample_text = sample.decode("utf-8")
-
-            # Count lines in sample
-            sample_lines = sample_text.count("\n")
-
-            # Get decompressed size of sample
-            decompressed_sample_size = len(sample_text.encode("utf-8"))
-
-            # Calculate compression ratio
-            compression_ratio = decompressed_sample_size / sample_size
-
-            # Estimate total decompressed size
-            estimated_total_decompressed = total_size * compression_ratio
-
-            # Estimate total lines
-            lines_per_byte = sample_lines / decompressed_sample_size
-            estimated_total_lines = int(estimated_total_decompressed * lines_per_byte)
-
-            # Add some padding for safety
-            return int(estimated_total_lines * 1.1)  # Add 10% padding
-
-
-def local_data(file_path, rank, world_size, total_lines):
-    """Optimized data loading with buffering"""
-    chunk_size = total_lines // world_size
-    start_line = rank * chunk_size
-    end_line = start_line + chunk_size if rank != world_size - 1 else total_lines
-
-    buffer = []
-    BUFFER_SIZE = 1000
-
-    current_line = 0
-    with open(file_path, "rb") as file:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(file) as reader:
-            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
-            for line in text_reader:
-                if start_line <= current_line < end_line:
-                    buffer.append(line)
-                    if len(buffer) >= BUFFER_SIZE:
-                        yield from buffer
-                        buffer = []
-                elif current_line >= end_line:
-                    break
-                current_line += 1
-
-            if buffer:
-                yield from buffer
-
-
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
@@ -126,35 +66,53 @@ def process_labels(
     return item_data
 
 
-def batch_process(
+def local_data_adaptive(file_path, rank, world_size, chunk_size_mb=1024):
+    """Process data in chunks without knowing total line count"""
+    file_size = os.path.getsize(file_path)
+    chunk_size = file_size // world_size
+    start_pos = rank * chunk_size
+    end_pos = start_pos + chunk_size if rank != world_size - 1 else file_size
+
+    with open(file_path, "rb") as file:
+        file.seek(start_pos)
+
+        # If not first chunk, read until next newline
+        if rank > 0:
+            file.readline()  # Skip partial line
+
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(file) as reader:
+            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
+
+            while file.tell() < end_pos:
+                line = text_reader.readline()
+                if not line:
+                    break
+                yield line
+
+
+def batch_process_adaptive(
     rank,
     world_size,
     model,
     tokenizer,
     input_path,
-    total_lines,
     batch_size=128,
     max_batch_length=12800,
 ):
-    data_iterator = local_data(input_path, rank, world_size, total_lines)
+    data_iterator = local_data_adaptive(input_path, rank, world_size)
     device = torch.device(f"cuda:{rank}")
     model.to(device)
 
-    # Set up progress bar
+    # Set up progress bar based on file size rather than line count
+    file_size = os.path.getsize(input_path)
+    chunk_size = file_size // world_size
     pbar = None
     if rank == 0:
-        pbar = tqdm(total=total_lines // world_size, desc=f"GPU {rank}")
-
-    # Pre-allocate GPU memory for batch tensors
-    max_length = 512
-    input_ids_buffer = torch.zeros(
-        (batch_size, max_length), dtype=torch.long, device=device
-    )
-    attention_mask_buffer = torch.zeros(
-        (batch_size, max_length), dtype=torch.long, device=device
-    )
+        pbar = tqdm(total=chunk_size, desc=f"GPU {rank} (bytes)")
 
     processed_count = 0
+    last_position = 0
 
     while True:
         large_batch = list(islice(data_iterator, max_batch_length))
@@ -164,10 +122,11 @@ def batch_process(
         text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
         texts = [item[1]["text"] for item in text_data]
 
+        # Batch tokenize on CPU
         encodings = tokenizer(
             texts,
             truncation=True,
-            max_length=max_length,
+            max_length=512,
             padding=False,
             return_tensors=None,
         )
@@ -190,21 +149,23 @@ def batch_process(
             # Get the maximum length in this batch
             current_length = max(len(seq) for seq in batch_encodings["input_ids"])
 
-            # Reset buffers to zero
-            input_ids_buffer.zero_()
-            attention_mask_buffer.zero_()
+            # Manually create padded tensors
+            input_ids = torch.zeros(
+                (current_batch_size, current_length), dtype=torch.long
+            )
+            attention_mask = torch.zeros(
+                (current_batch_size, current_length), dtype=torch.long
+            )
 
-            # Fill the pre-allocated buffers
+            # Fill the tensors with actual values
             for j, seq in enumerate(batch_encodings["input_ids"]):
                 seq_len = len(seq)
-                input_ids_buffer[j, :seq_len].copy_(
-                    torch.tensor(seq, dtype=torch.long, device=device)
-                )
-                attention_mask_buffer[j, :seq_len] = 1
+                input_ids[j, :seq_len] = torch.tensor(seq, dtype=torch.long)
+                attention_mask[j, :seq_len] = 1
 
-            # Use views of the buffers for the current batch
-            input_ids = input_ids_buffer[:current_batch_size, :current_length]
-            attention_mask = attention_mask_buffer[:current_batch_size, :current_length]
+            # Move to GPU
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
 
             with torch.no_grad():
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -225,8 +186,12 @@ def batch_process(
                 processed_results.append((batch_indices[orig_idx], processed_item))
                 processed_count += 1
 
-            if rank == 0 and pbar is not None:
-                pbar.update(current_batch_size)
+        # Update progress bar based on file position
+        if rank == 0 and pbar is not None:
+            with open(input_path, "rb") as f:
+                current_position = f.tell()
+                pbar.update(current_position - last_position)
+                last_position = current_position
 
         processed_results.sort(key=lambda x: x[0])
         yield [item for _, item in processed_results]
@@ -235,20 +200,9 @@ def batch_process(
         pbar.close()
 
 
-def process_and_save_ddp(rank, cfg, world_size):
+def process_and_save_ddp_adaptive(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-
-    if rank == 0:
-        # Use estimation instead of exact count
-        total_lines = estimate_lines_in_zst(cfg.input_path)
-        print(f"Estimated lines to process: {total_lines}")
-    else:
-        total_lines = None
-
-    total_lines = torch.tensor(total_lines if total_lines is not None else 0).to(device)
-    dist.broadcast(total_lines, src=0)
-    total_lines = total_lines.item()
 
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
@@ -274,13 +228,12 @@ def process_and_save_ddp(rank, cfg, world_size):
     with open(temp_output_path, "wb", buffering=WRITE_BUFFER_SIZE) as out_file:
         cctx = zstd.ZstdCompressor(level=1)  # Faster compression
         with cctx.stream_writer(out_file) as writer:
-            for processed_batch in batch_process(
+            for processed_batch in batch_process_adaptive(
                 rank,
                 world_size,
                 model,
                 tokenizer,
                 cfg.input_path,
-                total_lines,
                 cfg.batch_size,
                 cfg.max_batch_length,
             ):
@@ -336,7 +289,12 @@ def main():
 
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
-    mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
+    mp.spawn(
+        process_and_save_ddp_adaptive,
+        args=(cfg, world_size),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 if __name__ == "__main__":
