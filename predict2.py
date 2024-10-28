@@ -162,11 +162,12 @@ def batch_process(
                     for k, v in batch_tokens.items()
                 }
                 outputs = model(**batch_tokens)
+                # Cast outputs back to float32 for sigmoid
+                if isinstance(outputs.logits, torch.Tensor):
+                    outputs.logits = outputs.logits.float()
+
                 probabilities = sigmoid(outputs.logits)
                 predicted_labels = (probabilities > 0.5).int()
-
-            # Convert back to float32 for CPU operations
-            probabilities = probabilities.float()
 
             for orig_idx, (item_data, prob, pred_label) in enumerate(
                 zip(batch_items, probabilities, predicted_labels)
