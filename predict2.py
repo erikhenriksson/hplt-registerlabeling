@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# Define input and output paths
+# Labels structure remains the same
 labels_structure = {
     "MT": [],
     "LY": [],
@@ -37,17 +37,36 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
-# Data reading function for .zst files
-def local_data(file_path):
+def count_lines_in_zst(file_path):
+    count = 0
+    with open(file_path, "rb") as f:
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(f) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            for _ in text_stream:
+                count += 1
+    return count
+
+
+def local_data(file_path, rank, world_size, total_lines):
+    """Modified to return only the chunk for this rank"""
+    chunk_size = total_lines // world_size
+    start_line = rank * chunk_size
+    end_line = start_line + chunk_size if rank != world_size - 1 else total_lines
+
+    current_line = 0
     with open(file_path, "rb") as file:
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(file) as reader:
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
             for line in text_reader:
-                yield line
+                if start_line <= current_line < end_line:
+                    yield line
+                elif current_line >= end_line:
+                    break
+                current_line += 1
 
 
-# Distributed setup and cleanup functions
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
@@ -58,11 +77,17 @@ def cleanup():
     dist.destroy_process_group()
 
 
-# Batched processing function
 def batch_process(
-    rank, model, tokenizer, input_path, batch_size=64, max_batch_length=12800
+    rank,
+    world_size,
+    model,
+    tokenizer,
+    input_path,
+    total_lines,
+    batch_size=64,
+    max_batch_length=12800,
 ):
-    data_iterator = local_data(input_path)
+    data_iterator = local_data(input_path, rank, world_size, total_lines)
     device = torch.device(f"cuda:{rank}")
     model.to(device)
 
@@ -81,7 +106,8 @@ def batch_process(
 
         processed_results = []
         for i in range(0, len(text_data), batch_size):
-            print("Processing batch", i)
+            if rank == 0:  # Only print progress from rank 0
+                print(f"GPU {rank} processing batch {i}")
             batch = text_data[i : i + batch_size]
             batch_indices = [item[0] for item in batch]
             batch_items = [item[1] for item in batch]
@@ -124,30 +150,48 @@ def batch_process(
         yield [item for _, item in processed_results]
 
 
-# Process and save function
 def process_and_save_ddp(rank, cfg, world_size):
-    print("Begin")
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
+
+    # Calculate total lines only once on rank 0 and broadcast to all ranks
+    if rank == 0:
+        total_lines = count_lines_in_zst(cfg.input_path)
+        print(f"Total lines to process: {total_lines}")
+    else:
+        total_lines = None
+
+    # Broadcast total_lines from rank 0 to all processes
+    total_lines = torch.tensor(total_lines if total_lines is not None else 0).to(device)
+    dist.broadcast(total_lines, src=0)
+    total_lines = total_lines.item()
 
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
     )
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+
     with open(f"{cfg.model_path}/config.json", "r") as config_file:
         config = json.load(config_file)
     tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
 
+    # Modify output path to create separate files for each rank
+    rank_output_path = cfg.output_path.replace(".zst", f"_rank{rank}.zst")
+
     start_time = time.time()
-    print("Start")
-    with open(cfg.output_path, "wb") as out_file:
+    if rank == 0:
+        print(f"Starting processing on GPU {rank}")
+
+    with open(rank_output_path, "wb") as out_file:
         cctx = zstd.ZstdCompressor()
         with cctx.stream_writer(out_file) as writer:
             for processed_batch in batch_process(
                 rank,
+                world_size,
                 model,
                 tokenizer,
                 cfg.input_path,
+                total_lines,
                 cfg.batch_size,
                 cfg.max_batch_length,
             ):
@@ -162,7 +206,6 @@ def process_and_save_ddp(rank, cfg, world_size):
     cleanup()
 
 
-# Main function to run with torch.multiprocessing.spawn
 def main():
     parser = ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=64)
