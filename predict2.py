@@ -105,7 +105,9 @@ def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=
 
             # Step 5: Run model inference
             with torch.no_grad():
-                outputs = model(**batch_tokens_padded)
+                with torch.cuda.amp.autocast():
+                    outputs = model(**batch_tokens_padded)
+                # outputs = model(**batch_tokens_padded)
                 probabilities = sigmoid(
                     outputs.logits
                 )  # Apply sigmoid to get probabilities
@@ -161,7 +163,7 @@ def process_and_save(cfg):
         device
     )
     model.eval()
-    model.half()
+
     with open(f"{cfg.model_path}/config.json", "r") as config_file:
         config = json.load(config_file)
     tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
