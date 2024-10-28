@@ -37,39 +37,24 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
-def local_data_adaptive(file_path, rank, world_size, chunk_size_mb=1024):
-    """Process data in chunks without knowing total line count"""
-    file_size = os.path.getsize(file_path)
-    chunk_size = file_size // world_size
-    start_pos = rank * chunk_size
-    end_pos = start_pos + chunk_size if rank != world_size - 1 else file_size
-
-    buffer = []
-    BUFFER_SIZE = 1000
-
+def local_data_adaptive(file_path, rank, world_size):
+    """Process data by assigning lines to ranks in round-robin fashion"""
     with open(file_path, "rb") as file:
-        file.seek(start_pos)
-
-        # If not first chunk, read until next newline
-        if rank > 0:
-            file.readline()  # Skip partial line
-
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(file) as reader:
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
 
-            while file.tell() < end_pos:
-                try:
-                    line = text_reader.readline()
-                    if not line:
-                        break
+            buffer = []
+            BUFFER_SIZE = 1000
+            current_line = 0
+
+            for line in text_reader:
+                if current_line % world_size == rank:  # Distribute lines round-robin
                     buffer.append(line)
                     if len(buffer) >= BUFFER_SIZE:
                         yield from buffer
                         buffer = []
-                except Exception as e:
-                    print(f"Error reading line: {e}")
-                    continue
+                current_line += 1
 
             if buffer:  # Yield remaining items
                 yield from buffer
