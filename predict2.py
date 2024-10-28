@@ -5,6 +5,8 @@ from argparse import ArgumentParser
 import zstandard as zstd
 import io
 import json
+import time
+from tqdm import tqdm
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from itertools import islice
@@ -13,6 +15,39 @@ from torch.nn.functional import sigmoid
 # Define input and output paths
 input_file = "data/en/1_sample.jsonl.zst"
 output_file = "data/en/1_sample_registers.jsonl.zst"
+
+labels_structure = {
+    "MT": [],
+    "LY": [],
+    "SP": ["it"],
+    "ID": [],
+    "NA": ["ne", "sr", "nb"],
+    "HI": ["re"],
+    "IN": ["en", "ra", "dtp", "fi", "lt"],
+    "OP": ["rv", "ob", "rs", "av"],
+    "IP": ["ds", "ed"],
+}
+
+labels_all = [k for k in labels_structure.keys()] + [
+    item for row in labels_structure.values() for item in row
+]
+
+
+# Create a mapping from child labels to parent labels
+child_to_parent = {}
+for parent, children in labels_structure.items():
+    for child in children:
+        child_to_parent[child] = parent
+
+# Create a mapping from labels to their indices
+label_to_index = {label: idx for idx, label in enumerate(labels_all)}
+
+
+def decode_binary_labels(data):
+    return [
+        " ".join([labels_all[i] for i, bin_val in enumerate(bin) if bin_val == 1])
+        for bin in data
+    ]
 
 
 # Data reading function for .zst files
@@ -26,7 +61,7 @@ def local_data(file_path):
 
 
 # Processing function with batched encoding
-def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=12800):
+def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=128):
     data_iterator = local_data(input_path)
 
     while True:
@@ -79,21 +114,42 @@ def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=
         for idx, item_data, prob, pred_label in zip(
             batch_indices, batch_items, probabilities, predicted_labels
         ):
-            item_data["registers"] = pred_label.nonzero(as_tuple=True)[0].tolist()
-            item_data["register_probabilities"] = prob.tolist()
+
+            # Convert binary labels to label names and enforce parent-child relationship
+            labels_indexes = (
+                pred_label.tolist()
+            )  # binary list representing active labels
+            labeled_registers = []
+
+            # Step 1: Iterate through each label and ensure that when a child is present, so is the parent
+            for i, label in enumerate(labels_all):
+                if labels_indexes[i] == 1:  # label is active
+                    if label in child_to_parent:  # check if it's a child label
+                        parent_label = child_to_parent[label]
+                        parent_index = label_to_index[parent_label]
+                        labels_indexes[parent_index] = 1  # set parent label as active
+
+            # Step 2: Create the list of active label names based on the updated labels_indexes
+            labeled_registers = [
+                labels_all[i] for i, active in enumerate(labels_indexes) if active == 1
+            ]
+
+            # Step 3: Add modified labels and probabilities to item_data
+            item_data["registers"] = labeled_registers  # active label names
+            item_data["register_probabilities"] = [
+                round(float(p), 4) for p in prob.tolist()
+            ]  # 4 decimal places
+
             processed_results.append((idx, item_data))
 
         # Step 7: Sort processed results back to original order
         processed_results.sort(key=lambda x: x[0])
 
-        print(processed_results[0])
-        exit()
-
         # Step 8: Yield results in the original order
         yield [item for _, item in processed_results]
 
 
-# Example usage to process and write to output file
+# Wrap process_and_save with timing functionality
 def process_and_save(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -102,10 +158,11 @@ def process_and_save(cfg):
         device
     )
     model.eval()
-    # Get the original model's name and init tokenizer
     with open(f"{cfg.model_path}/config.json", "r") as config_file:
         config = json.load(config_file)
     tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
+
+    start_time = time.time()  # Start timing
 
     # Open output file with Zstandard compression
     with open(cfg.output_path, "wb") as out_file:
@@ -118,6 +175,11 @@ def process_and_save(cfg):
                     # Write each item as a JSON line with the "register" field added
                     line = json.dumps(item) + "\n"
                     writer.write(line.encode("utf-8"))
+
+    end_time = time.time()  # End timing
+
+    total_time = end_time - start_time
+    print(f"Total processing time: {total_time:.2f} seconds")
 
 
 if __name__ == "__main__":
