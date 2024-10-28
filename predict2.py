@@ -167,28 +167,29 @@ def batch_process(
                 for key in encodings.keys()
             }
 
-            # Pad and move to GPU efficiently
-            padded = tokenizer.pad(batch_encodings, padding=True, return_tensors=None)
+            # Get the maximum length in this batch
+            current_length = max(len(seq) for seq in batch_encodings["input_ids"])
 
-            # Reuse pre-allocated buffers
-            current_length = padded["input_ids"][0].shape[0]
-            input_ids_buffer[:current_batch_size, :current_length] = torch.tensor(
-                padded["input_ids"], device=device
+            # Manually create padded tensors
+            input_ids = torch.zeros(
+                (current_batch_size, current_length), dtype=torch.long
             )
-            attention_mask_buffer[:current_batch_size, :current_length] = torch.tensor(
-                padded["attention_mask"], device=device
+            attention_mask = torch.zeros(
+                (current_batch_size, current_length), dtype=torch.long
             )
 
-            # Create valid slices of the buffers
-            batch_input_ids = input_ids_buffer[:current_batch_size, :current_length]
-            batch_attention_mask = attention_mask_buffer[
-                :current_batch_size, :current_length
-            ]
+            # Fill the tensors with actual values
+            for j, seq in enumerate(batch_encodings["input_ids"]):
+                seq_len = len(seq)
+                input_ids[j, :seq_len] = torch.tensor(seq, dtype=torch.long)
+                attention_mask[j, :seq_len] = 1
+
+            # Move to GPU
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
 
             with torch.no_grad():
-                outputs = model(
-                    input_ids=batch_input_ids, attention_mask=batch_attention_mask
-                )
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 probabilities = sigmoid(outputs.logits)
                 predicted_labels = (probabilities > 0.5).int()
 
