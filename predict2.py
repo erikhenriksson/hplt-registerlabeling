@@ -91,10 +91,17 @@ def batch_process(
     device = torch.device(f"cuda:{rank}")
     model.to(device)
 
+    # Add a counter for this rank
+    total_processed = 0
+
+    print(f"GPU {rank}: Starting processing")  # Add initial log
+
     while True:
         large_batch = list(islice(data_iterator, max_batch_length))
         if not large_batch:
             break  # End of data
+
+        print(f"GPU {rank}: Got batch of size {len(large_batch)}")  # Log batch size
 
         text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
         text_data = [
@@ -106,12 +113,21 @@ def batch_process(
 
         processed_results = []
         for i in range(0, len(text_data), batch_size):
-            if rank == 0:  # Only print progress from rank 0
-                print(f"GPU {rank} processing batch {i}")
+            print(
+                f"GPU {rank}: Processing mini-batch {i//batch_size} of size {min(batch_size, len(text_data)-i)}"
+            )
             batch = text_data[i : i + batch_size]
             batch_indices = [item[0] for item in batch]
             batch_items = [item[1] for item in batch]
             batch_tokens = [item[2] for item in batch]
+
+            # Log GPU memory usage periodically
+            if i % (batch_size * 10) == 0:
+                memory_allocated = torch.cuda.memory_allocated(device=device) / 1024**2
+                memory_reserved = torch.cuda.memory_reserved(device=device) / 1024**2
+                print(
+                    f"GPU {rank}: Memory allocated: {memory_allocated:.2f}MB, Reserved: {memory_reserved:.2f}MB"
+                )
 
             batch_tokens_padded = tokenizer.pad(
                 batch_tokens, padding=True, return_tensors="pt"
@@ -145,14 +161,21 @@ def batch_process(
                 ]
 
                 processed_results.append((idx, item_data))
+                total_processed += 1
 
         processed_results.sort(key=lambda x: x[0])
+        print(f"GPU {rank}: Total processed so far: {total_processed}")  # Log progress
         yield [item for _, item in processed_results]
 
 
 def process_and_save_ddp(rank, cfg, world_size):
+    print(f"Initializing process on GPU {rank}")  # Log process initialization
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
+
+    # Verify CUDA device assignment
+    print(f"GPU {rank}: CUDA device count: {torch.cuda.device_count()}")
+    print(f"GPU {rank}: Current CUDA device: {torch.cuda.current_device()}")
 
     # Calculate total lines only once on rank 0 and broadcast to all ranks
     if rank == 0:
@@ -166,6 +189,14 @@ def process_and_save_ddp(rank, cfg, world_size):
     dist.broadcast(total_lines, src=0)
     total_lines = total_lines.item()
 
+    # Calculate expected lines for this rank
+    lines_per_rank = total_lines // world_size
+    if rank == world_size - 1:
+        my_lines = lines_per_rank + (total_lines % world_size)
+    else:
+        my_lines = lines_per_rank
+    print(f"GPU {rank}: Expected to process {my_lines} lines")
+
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
     )
@@ -177,10 +208,9 @@ def process_and_save_ddp(rank, cfg, world_size):
 
     # Modify output path to create separate files for each rank
     rank_output_path = cfg.output_path.replace(".zst", f"_rank{rank}.zst")
+    print(f"GPU {rank}: Will save output to {rank_output_path}")
 
     start_time = time.time()
-    if rank == 0:
-        print(f"Starting processing on GPU {rank}")
 
     with open(rank_output_path, "wb") as out_file:
         cctx = zstd.ZstdCompressor()
@@ -200,8 +230,7 @@ def process_and_save_ddp(rank, cfg, world_size):
                     writer.write(line.encode("utf-8"))
 
     end_time = time.time()
-    if rank == 0:
-        print(f"Total processing time: {end_time - start_time:.2f} seconds")
+    print(f"GPU {rank}: Finished processing in {end_time - start_time:.2f} seconds")
 
     cleanup()
 
