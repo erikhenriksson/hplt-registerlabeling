@@ -67,7 +67,7 @@ def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=
     while True:
         # Step 1: Take a large chunk of data
         large_batch = list(islice(data_iterator, max_batch_length))
-        print(f"Processing batch of {len(large_batch)} lines")
+        print(f"Processing batch of {len(large_batch)} documents")
         if not large_batch:
             break  # End of data
 
@@ -188,7 +188,7 @@ def process_and_save(cfg):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--max_batch_length", type=int, default=50000)
+    parser.add_argument("--max_batch_length", type=int, default=1000)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/en/1_sample.jsonl.zst")
     parser.add_argument(
