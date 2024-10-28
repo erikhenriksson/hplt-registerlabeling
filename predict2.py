@@ -257,3 +257,7 @@ def main():
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
+
+
+if __name__ == "__main__":
+    main()
