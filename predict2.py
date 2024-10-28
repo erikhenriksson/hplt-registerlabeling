@@ -169,33 +169,18 @@ def batch_process(
 
 
 def process_and_save_ddp(rank, cfg, world_size):
-    print(f"Initializing process on GPU {rank}")  # Log process initialization
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    # Verify CUDA device assignment
-    print(f"GPU {rank}: CUDA device count: {torch.cuda.device_count()}")
-    print(f"GPU {rank}: Current CUDA device: {torch.cuda.current_device()}")
-
-    # Calculate total lines only once on rank 0 and broadcast to all ranks
     if rank == 0:
         total_lines = count_lines_in_zst(cfg.input_path)
         print(f"Total lines to process: {total_lines}")
     else:
         total_lines = None
 
-    # Broadcast total_lines from rank 0 to all processes
     total_lines = torch.tensor(total_lines if total_lines is not None else 0).to(device)
     dist.broadcast(total_lines, src=0)
     total_lines = total_lines.item()
-
-    # Calculate expected lines for this rank
-    lines_per_rank = total_lines // world_size
-    if rank == world_size - 1:
-        my_lines = lines_per_rank + (total_lines % world_size)
-    else:
-        my_lines = lines_per_rank
-    print(f"GPU {rank}: Expected to process {my_lines} lines")
 
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
@@ -206,13 +191,14 @@ def process_and_save_ddp(rank, cfg, world_size):
         config = json.load(config_file)
     tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
 
-    # Modify output path to create separate files for each rank
-    rank_output_path = cfg.output_path.replace(".zst", f"_rank{rank}.zst")
-    print(f"GPU {rank}: Will save output to {rank_output_path}")
+    # Create temporary file for this rank
+    temp_output_path = f"{cfg.output_path}.temp_{rank}"
 
     start_time = time.time()
+    print(f"GPU {rank}: Starting processing")
 
-    with open(rank_output_path, "wb") as out_file:
+    # Process and save to temporary file
+    with open(temp_output_path, "wb") as out_file:
         cctx = zstd.ZstdCompressor()
         with cctx.stream_writer(out_file) as writer:
             for processed_batch in batch_process(
@@ -232,12 +218,34 @@ def process_and_save_ddp(rank, cfg, world_size):
     end_time = time.time()
     print(f"GPU {rank}: Finished processing in {end_time - start_time:.2f} seconds")
 
+    # Make sure all processes have finished writing their temp files
+    dist.barrier()
+
+    # Only rank 0 combines the results
+    if rank == 0:
+        print("Combining results from all GPUs...")
+        with open(cfg.output_path, "wb") as final_out:
+            cctx = zstd.ZstdCompressor()
+            with cctx.stream_writer(final_out) as final_writer:
+                # Read and write from each temp file in order
+                for r in range(world_size):
+                    temp_file = f"{cfg.output_path}.temp_{r}"
+                    with open(temp_file, "rb") as temp_in:
+                        dctx = zstd.ZstdDecompressor()
+                        with dctx.stream_reader(temp_in) as reader:
+                            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
+                            for line in text_reader:
+                                final_writer.write(line.encode("utf-8"))
+                    # Remove temp file
+                    os.remove(temp_file)
+        print("Results combined successfully!")
+
     cleanup()
 
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_batch_length", type=int, default=1000)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/en/1_sample.jsonl.zst")
@@ -249,7 +257,3 @@ def main():
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
-
-
-if __name__ == "__main__":
-    main()
