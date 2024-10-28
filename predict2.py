@@ -37,26 +37,74 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
+def find_approximate_offsets(file_path, world_size):
+    """Find approximate file offsets for each rank"""
+    file_size = os.path.getsize(file_path)
+    chunk_size = file_size // world_size
+
+    offsets = []
+    with open(file_path, "rb") as f:
+        # First offset is always 0
+        offsets.append(0)
+
+        # Find remaining offsets
+        for i in range(1, world_size):
+            target_pos = i * chunk_size
+            f.seek(target_pos)
+
+            # Read ahead to find a frame boundary
+            buffer = f.read(1024 * 1024)  # Read 1MB ahead
+            frame_magic = b"\x28\xB5\x2F\xFD"  # zstd frame magic number
+
+            # Find next frame start
+            frame_pos = buffer.find(frame_magic)
+            if frame_pos != -1:
+                offsets.append(target_pos + frame_pos)
+            else:
+                # If no frame found, use original position
+                offsets.append(target_pos)
+
+        # Last offset is file size
+        offsets.append(file_size)
+
+    return offsets
+
+
 def local_data_adaptive(file_path, rank, world_size):
-    """Process data by assigning lines to ranks in round-robin fashion"""
+    """Process data chunks efficiently while respecting zstd frames"""
+    # Get valid file offsets
+    offsets = find_approximate_offsets(file_path, world_size)
+    start_pos = offsets[rank]
+    end_pos = offsets[rank + 1]
+
+    buffer = []
+    BUFFER_SIZE = 1000
+
     with open(file_path, "rb") as file:
+        # Seek to start position
+        file.seek(start_pos)
+
         dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(file) as reader:
+        # Read the chunk that belongs to this rank
+        chunk = file.read(end_pos - start_pos)
+        with dctx.stream_reader(io.BytesIO(chunk)) as reader:
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
 
-            buffer = []
-            BUFFER_SIZE = 1000
-            current_line = 0
+            while True:
+                try:
+                    line = text_reader.readline()
+                    if not line:
+                        break
 
-            for line in text_reader:
-                if current_line % world_size == rank:  # Distribute lines round-robin
                     buffer.append(line)
                     if len(buffer) >= BUFFER_SIZE:
                         yield from buffer
                         buffer = []
-                current_line += 1
+                except Exception as e:
+                    print(f"Error reading line on rank {rank}: {e}")
+                    continue
 
-            if buffer:  # Yield remaining items
+            if buffer:
                 yield from buffer
 
 
