@@ -64,6 +64,10 @@ def local_data(file_path):
 def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=12800):
     data_iterator = local_data(input_path)
 
+    import torch.quantization as tq
+
+    model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+
     while True:
         # Step 1: Take a large chunk of data
         large_batch = list(islice(data_iterator, max_batch_length))
@@ -105,9 +109,7 @@ def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=
 
             # Step 5: Run model inference
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
-                    outputs = model(**batch_tokens_padded)
-                # outputs = model(**batch_tokens_padded)
+                outputs = model(**batch_tokens_padded)
                 probabilities = sigmoid(
                     outputs.logits
                 )  # Apply sigmoid to get probabilities
@@ -163,7 +165,6 @@ def process_and_save(cfg):
         device
     )
     model.eval()
-
     with open(f"{cfg.model_path}/config.json", "r") as config_file:
         config = json.load(config_file)
     tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
