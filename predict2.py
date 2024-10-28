@@ -14,7 +14,6 @@ from itertools import islice
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.cuda.amp import autocast
 
 # Labels structure
 labels_structure = {
@@ -157,7 +156,11 @@ def batch_process(
             ).to(device)
 
             # Use autocast for mixed precision
-            with torch.no_grad(), autocast(dtype=torch.float16):
+            with torch.no_grad():
+                batch_tokens = {
+                    k: v.to(dtype=torch.float16) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch_tokens.items()
+                }
                 outputs = model(**batch_tokens)
                 probabilities = sigmoid(outputs.logits)
                 predicted_labels = (probabilities > 0.5).int()
