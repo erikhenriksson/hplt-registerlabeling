@@ -37,15 +37,36 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
-def count_lines_in_zst(file_path):
-    count = 0
+def estimate_lines_in_zst(file_path, sample_size=100 * 1024 * 1024):  # 100MB sample
+    """Estimate total lines by sampling the file"""
+    total_size = os.path.getsize(file_path)
+
+    # Read a sample of the compressed file
     with open(file_path, "rb") as f:
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(f) as reader:
-            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-            for _ in text_stream:
-                count += 1
-    return count
+            # Read first chunk to get compression ratio
+            sample = reader.read(sample_size)
+            sample_text = sample.decode("utf-8")
+
+            # Count lines in sample
+            sample_lines = sample_text.count("\n")
+
+            # Get decompressed size of sample
+            decompressed_sample_size = len(sample_text.encode("utf-8"))
+
+            # Calculate compression ratio
+            compression_ratio = decompressed_sample_size / sample_size
+
+            # Estimate total decompressed size
+            estimated_total_decompressed = total_size * compression_ratio
+
+            # Estimate total lines
+            lines_per_byte = sample_lines / decompressed_sample_size
+            estimated_total_lines = int(estimated_total_decompressed * lines_per_byte)
+
+            # Add some padding for safety
+            return int(estimated_total_lines * 1.1)  # Add 10% padding
 
 
 def local_data(file_path, rank, world_size, total_lines):
@@ -223,8 +244,9 @@ def process_and_save_ddp(rank, cfg, world_size):
     device = torch.device(f"cuda:{rank}")
 
     if rank == 0:
-        total_lines = count_lines_in_zst(cfg.input_path)
-        print(f"Total lines to process: {total_lines}")
+        # Use estimation instead of exact count
+        total_lines = estimate_lines_in_zst(cfg.input_path)
+        print(f"Estimated lines to process: {total_lines}")
     else:
         total_lines = None
 
