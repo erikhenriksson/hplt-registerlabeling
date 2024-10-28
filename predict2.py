@@ -164,7 +164,6 @@ def batch_process(
         text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
         texts = [item[1]["text"] for item in text_data]
 
-        # Batch tokenize on CPU
         encodings = tokenizer(
             texts,
             truncation=True,
@@ -191,23 +190,21 @@ def batch_process(
             # Get the maximum length in this batch
             current_length = max(len(seq) for seq in batch_encodings["input_ids"])
 
-            # Manually create padded tensors
-            input_ids = torch.zeros(
-                (current_batch_size, current_length), dtype=torch.long
-            )
-            attention_mask = torch.zeros(
-                (current_batch_size, current_length), dtype=torch.long
-            )
+            # Reset buffers to zero
+            input_ids_buffer.zero_()
+            attention_mask_buffer.zero_()
 
-            # Fill the tensors with actual values
+            # Fill the pre-allocated buffers
             for j, seq in enumerate(batch_encodings["input_ids"]):
                 seq_len = len(seq)
-                input_ids[j, :seq_len] = torch.tensor(seq, dtype=torch.long)
-                attention_mask[j, :seq_len] = 1
+                input_ids_buffer[j, :seq_len].copy_(
+                    torch.tensor(seq, dtype=torch.long, device=device)
+                )
+                attention_mask_buffer[j, :seq_len] = 1
 
-            # Move to GPU
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
+            # Use views of the buffers for the current batch
+            input_ids = input_ids_buffer[:current_batch_size, :current_length]
+            attention_mask = attention_mask_buffer[:current_batch_size, :current_length]
 
             with torch.no_grad():
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -228,7 +225,6 @@ def batch_process(
                 processed_results.append((batch_indices[orig_idx], processed_item))
                 processed_count += 1
 
-            # Update progress bar
             if rank == 0 and pbar is not None:
                 pbar.update(current_batch_size)
 
