@@ -187,7 +187,7 @@ def process_and_save(cfg):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--max_batch_length", type=int, default=1000)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/en/1_sample.jsonl.zst")
