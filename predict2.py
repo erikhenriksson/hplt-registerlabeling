@@ -278,17 +278,10 @@ def main():
     parser.add_argument(
         "--output_path", default="data/en/1_sample_register_labels.jsonl.zst"
     )
-    # Add mixed precision flag
-    parser.add_argument(
-        "--mixed_precision",
-        action="store_true",
-        help="Enable mixed precision (FP16) inference",
-    )
     cfg = parser.parse_args()
 
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
-    print("Mixed precision enabled" if cfg.mixed_precision else "Using full precision")
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
 
 
