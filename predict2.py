@@ -48,6 +48,31 @@ def count_lines_in_zst(file_path):
     return count
 
 
+def local_data_adaptive(file_path, rank, world_size, chunk_size_mb=1024):
+    """Process data in chunks without knowing total line count"""
+    file_size = os.path.getsize(file_path)
+    chunk_size = file_size // world_size
+    start_pos = rank * chunk_size
+    end_pos = start_pos + chunk_size if rank != world_size - 1 else file_size
+
+    with open(file_path, "rb") as file:
+        file.seek(start_pos)
+
+        # If not first chunk, read until next newline
+        if rank > 0:
+            file.readline()  # Skip partial line
+
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(file) as reader:
+            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
+
+            while file.tell() < end_pos:
+                line = text_reader.readline()
+                if not line:
+                    break
+                yield line
+
+
 def local_data(file_path, rank, world_size, total_lines):
     """Optimized data loading with buffering"""
     chunk_size = total_lines // world_size
@@ -111,11 +136,11 @@ def batch_process(
     model,
     tokenizer,
     input_path,
-    total_lines,
+    # total_lines,
     batch_size=128,
     max_batch_length=12800,
 ):
-    data_iterator = local_data(input_path, rank, world_size, total_lines)
+    data_iterator = local_data_adaptive(input_path, rank, world_size, total_lines)
     device = torch.device(f"cuda:{rank}")
     model.to(device)
 
@@ -217,7 +242,7 @@ def batch_process(
 def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-
+    """
     if rank == 0:
         total_lines = count_lines_in_zst(cfg.input_path)
         print(f"Total lines to process: {total_lines}")
@@ -227,7 +252,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     total_lines = torch.tensor(total_lines if total_lines is not None else 0).to(device)
     dist.broadcast(total_lines, src=0)
     total_lines = total_lines.item()
-
+    """
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
     )
@@ -258,7 +283,7 @@ def process_and_save_ddp(rank, cfg, world_size):
                 model,
                 tokenizer,
                 cfg.input_path,
-                total_lines,
+                # total_lines,
                 cfg.batch_size,
                 cfg.max_batch_length,
             ):
