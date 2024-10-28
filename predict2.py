@@ -161,6 +161,7 @@ def process_and_save(cfg):
         device
     )
     model.eval()
+    model.half()
     with open(f"{cfg.model_path}/config.json", "r") as config_file:
         config = json.load(config_file)
     tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
@@ -187,7 +188,7 @@ def process_and_save(cfg):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_batch_length", type=int, default=1000)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/en/1_sample.jsonl.zst")
