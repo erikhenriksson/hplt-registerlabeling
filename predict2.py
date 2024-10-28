@@ -61,7 +61,7 @@ def local_data(file_path):
 
 
 # Processing function with batched encoding
-def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=128):
+def batch_process(model, tokenizer, input_path, batch_size=64, max_batch_length=12800):
     data_iterator = local_data(input_path)
 
     while True:

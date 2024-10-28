@@ -5,7 +5,7 @@ import io
 # Define the URLs and file paths
 url = "https://data.hplt-project.org/two/cleaned/eng_Latn/1.jsonl.zst"
 output_path = "data/en/1_sample.jsonl.zst"
-target_lines = 1000
+target_lines = 100000
 
 # Create zstd decompressor and compressor
 dctx = zstd.ZstdDecompressor()
