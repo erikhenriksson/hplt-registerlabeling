@@ -134,6 +134,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
 
     start_time = time.time()
+    print("Start")
     with open(cfg.output_path, "wb") as out_file:
         cctx = zstd.ZstdCompressor()
         with cctx.stream_writer(out_file) as writer:
