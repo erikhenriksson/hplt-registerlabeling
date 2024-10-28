@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# Labels structure remains the same
+# Labels structure
 labels_structure = {
     "MT": [],
     "LY": [],
@@ -49,10 +49,13 @@ def count_lines_in_zst(file_path):
 
 
 def local_data(file_path, rank, world_size, total_lines):
-    """Modified to return only the chunk for this rank"""
+    """Optimized data loading with buffering"""
     chunk_size = total_lines // world_size
     start_line = rank * chunk_size
     end_line = start_line + chunk_size if rank != world_size - 1 else total_lines
+
+    buffer = []
+    BUFFER_SIZE = 1000  # Adjust based on memory availability
 
     current_line = 0
     with open(file_path, "rb") as file:
@@ -61,10 +64,16 @@ def local_data(file_path, rank, world_size, total_lines):
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
             for line in text_reader:
                 if start_line <= current_line < end_line:
-                    yield line
+                    buffer.append(line)
+                    if len(buffer) >= BUFFER_SIZE:
+                        yield from buffer
+                        buffer = []
                 elif current_line >= end_line:
                     break
                 current_line += 1
+
+            if buffer:  # Yield remaining items
+                yield from buffer
 
 
 def setup(rank, world_size):
@@ -75,6 +84,26 @@ def setup(rank, world_size):
 
 def cleanup():
     dist.destroy_process_group()
+
+
+def process_labels(
+    item_data, prob, pred_label, labels_all, child_to_parent, label_to_index
+):
+    """Optimized label processing"""
+    labels_indexes = pred_label.tolist()
+
+    # Use set for faster lookups
+    active_labels = set()
+    for i, is_active in enumerate(labels_indexes):
+        if is_active == 1:
+            label = labels_all[i]
+            active_labels.add(label)
+            if label in child_to_parent:
+                active_labels.add(child_to_parent[label])
+
+    item_data["registers"] = list(active_labels)
+    item_data["register_probabilities"] = [round(float(p), 4) for p in prob.tolist()]
+    return item_data
 
 
 def batch_process(
@@ -91,80 +120,70 @@ def batch_process(
     device = torch.device(f"cuda:{rank}")
     model.to(device)
 
-    # Add a counter for this rank
-    total_processed = 0
-
-    print(f"GPU {rank}: Starting processing")  # Add initial log
+    processed_count = 0
 
     while True:
+        # Get a large batch of data
         large_batch = list(islice(data_iterator, max_batch_length))
         if not large_batch:
-            break  # End of data
+            break
 
-        print(f"GPU {rank}: Got batch of size {len(large_batch)}")  # Log batch size
-
+        # Parse JSON and extract texts in batch
         text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
-        text_data = [
-            (idx, item, tokenizer(item["text"], truncation=True, max_length=512))
-            for idx, item in text_data
-        ]
+        texts = [item[1]["text"] for item in text_data]
 
-        text_data.sort(key=lambda x: len(x[2]["input_ids"]))
+        # Batch tokenization
+        encodings = tokenizer(
+            texts, truncation=True, max_length=512, padding=False, return_tensors=None
+        )
+
+        # Sort by length for efficient batching
+        lengths = [len(ids) for ids in encodings["input_ids"]]
+        sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
 
         processed_results = []
-        for i in range(0, len(text_data), batch_size):
-            print(
-                f"GPU {rank}: Processing mini-batch {i//batch_size} of size {min(batch_size, len(text_data)-i)}"
-            )
-            batch = text_data[i : i + batch_size]
-            batch_indices = [item[0] for item in batch]
-            batch_items = [item[1] for item in batch]
-            batch_tokens = [item[2] for item in batch]
 
-            # Log GPU memory usage periodically
-            if i % (batch_size * 10) == 0:
-                memory_allocated = torch.cuda.memory_allocated(device=device) / 1024**2
-                memory_reserved = torch.cuda.memory_reserved(device=device) / 1024**2
-                print(
-                    f"GPU {rank}: Memory allocated: {memory_allocated:.2f}MB, Reserved: {memory_reserved:.2f}MB"
-                )
+        # Process in sorted batches
+        for i in range(0, len(sorted_indices), batch_size):
+            batch_indices = sorted_indices[i : i + batch_size]
 
-            batch_tokens_padded = tokenizer.pad(
-                batch_tokens, padding=True, return_tensors="pt"
+            # Collect batch items
+            batch_items = [text_data[idx][1] for idx in batch_indices]
+            batch_encodings = {
+                key: [encodings[key][idx] for idx in batch_indices]
+                for key in encodings.keys()
+            }
+
+            # Pad only within similar-length batches
+            batch_tokens = tokenizer.pad(
+                batch_encodings, padding=True, return_tensors="pt"
             ).to(device)
 
             with torch.no_grad():
-                outputs = model(**batch_tokens_padded)
+                outputs = model(**batch_tokens)
                 probabilities = sigmoid(outputs.logits)
                 predicted_labels = (probabilities > 0.5).int()
 
-            for idx, item_data, prob, pred_label in zip(
-                batch_indices, batch_items, probabilities, predicted_labels
+            # Process results
+            for orig_idx, (item_data, prob, pred_label) in enumerate(
+                zip(batch_items, probabilities, predicted_labels)
             ):
-                labels_indexes = pred_label.tolist()
-                labeled_registers = []
+                processed_item = process_labels(
+                    item_data.copy(),
+                    prob,
+                    pred_label,
+                    labels_all,
+                    child_to_parent,
+                    label_to_index,
+                )
+                processed_results.append((batch_indices[orig_idx], processed_item))
+                processed_count += 1
 
-                for i, label in enumerate(labels_all):
-                    if labels_indexes[i] == 1:
-                        if label in child_to_parent:
-                            parent_label = child_to_parent[label]
-                            labels_indexes[label_to_index[parent_label]] = 1
+            if processed_count % 1000 == 0:
+                print(f"GPU {rank}: Processed {processed_count} items")
 
-                labeled_registers = [
-                    labels_all[i]
-                    for i, active in enumerate(labels_indexes)
-                    if active == 1
-                ]
-                item_data["registers"] = labeled_registers
-                item_data["register_probabilities"] = [
-                    round(float(p), 4) for p in prob.tolist()
-                ]
-
-                processed_results.append((idx, item_data))
-                total_processed += 1
-
+        # Sort back to original order and yield
         processed_results.sort(key=lambda x: x[0])
-        print(f"GPU {rank}: Total processed so far: {total_processed}")  # Log progress
         yield [item for _, item in processed_results]
 
 
@@ -172,6 +191,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
+    # Get total lines count
     if rank == 0:
         total_lines = count_lines_in_zst(cfg.input_path)
         print(f"Total lines to process: {total_lines}")
@@ -182,6 +202,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     dist.broadcast(total_lines, src=0)
     total_lines = total_lines.item()
 
+    # Initialize model
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
     )
@@ -197,10 +218,12 @@ def process_and_save_ddp(rank, cfg, world_size):
     start_time = time.time()
     print(f"GPU {rank}: Starting processing")
 
-    # Process and save to temporary file
-    with open(temp_output_path, "wb") as out_file:
-        cctx = zstd.ZstdCompressor()
+    # Optimized writing with buffering
+    WRITE_BUFFER_SIZE = 1024 * 1024  # 1MB buffer
+    with open(temp_output_path, "wb", buffering=WRITE_BUFFER_SIZE) as out_file:
+        cctx = zstd.ZstdCompressor(level=3)  # Balance between compression and speed
         with cctx.stream_writer(out_file) as writer:
+            buffer = []
             for processed_batch in batch_process(
                 rank,
                 world_size,
@@ -211,32 +234,39 @@ def process_and_save_ddp(rank, cfg, world_size):
                 cfg.batch_size,
                 cfg.max_batch_length,
             ):
-                for item in processed_batch:
-                    line = json.dumps(item) + "\n"
-                    writer.write(line.encode("utf-8"))
+                buffer.extend(processed_batch)
+                if len(buffer) >= 1000:
+                    lines = [json.dumps(item) + "\n" for item in buffer]
+                    writer.write("".join(lines).encode("utf-8"))
+                    buffer = []
+
+            # Write remaining items
+            if buffer:
+                lines = [json.dumps(item) + "\n" for item in buffer]
+                writer.write("".join(lines).encode("utf-8"))
 
     end_time = time.time()
     print(f"GPU {rank}: Finished processing in {end_time - start_time:.2f} seconds")
 
-    # Make sure all processes have finished writing their temp files
+    # Synchronize before combining results
     dist.barrier()
 
     # Only rank 0 combines the results
     if rank == 0:
         print("Combining results from all GPUs...")
-        with open(cfg.output_path, "wb") as final_out:
-            cctx = zstd.ZstdCompressor()
+        with open(cfg.output_path, "wb", buffering=WRITE_BUFFER_SIZE) as final_out:
+            cctx = zstd.ZstdCompressor(level=3)
             with cctx.stream_writer(final_out) as final_writer:
-                # Read and write from each temp file in order
                 for r in range(world_size):
                     temp_file = f"{cfg.output_path}.temp_{r}"
                     with open(temp_file, "rb") as temp_in:
                         dctx = zstd.ZstdDecompressor()
                         with dctx.stream_reader(temp_in) as reader:
-                            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
-                            for line in text_reader:
-                                final_writer.write(line.encode("utf-8"))
-                    # Remove temp file
+                            while True:
+                                chunk = reader.read(WRITE_BUFFER_SIZE)
+                                if not chunk:
+                                    break
+                                final_writer.write(chunk)
                     os.remove(temp_file)
         print("Results combined successfully!")
 
