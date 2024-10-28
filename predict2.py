@@ -1,4 +1,6 @@
 import os
+
+os.environ["HF_HOME"] = ".hf/hf_home"
 import json
 import time
 import zstandard as zstd
