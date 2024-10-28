@@ -16,8 +16,95 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.cuda.amp import autocast
 
-# [Labels structure and other imports remain the same...]
-# [count_lines_in_zst, local_data, setup, cleanup, process_labels remain the same...]
+# Labels structure
+labels_structure = {
+    "MT": [],
+    "LY": [],
+    "SP": ["it"],
+    "ID": [],
+    "NA": ["ne", "sr", "nb"],
+    "HI": ["re"],
+    "IN": ["en", "ra", "dtp", "fi", "lt"],
+    "OP": ["rv", "ob", "rs", "av"],
+    "IP": ["ds", "ed"],
+}
+
+labels_all = [k for k in labels_structure.keys()] + [
+    item for row in labels_structure.values() for item in row
+]
+child_to_parent = {
+    child: parent for parent, children in labels_structure.items() for child in children
+}
+label_to_index = {label: idx for idx, label in enumerate(labels_all)}
+
+
+def count_lines_in_zst(file_path):
+    count = 0
+    with open(file_path, "rb") as f:
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(f) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            for _ in text_stream:
+                count += 1
+    return count
+
+
+def local_data(file_path, rank, world_size, total_lines):
+    """Optimized data loading with buffering"""
+    chunk_size = total_lines // world_size
+    start_line = rank * chunk_size
+    end_line = start_line + chunk_size if rank != world_size - 1 else total_lines
+
+    buffer = []
+    BUFFER_SIZE = 1000  # Adjust based on memory availability
+
+    current_line = 0
+    with open(file_path, "rb") as file:
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(file) as reader:
+            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
+            for line in text_reader:
+                if start_line <= current_line < end_line:
+                    buffer.append(line)
+                    if len(buffer) >= BUFFER_SIZE:
+                        yield from buffer
+                        buffer = []
+                elif current_line >= end_line:
+                    break
+                current_line += 1
+
+            if buffer:  # Yield remaining items
+                yield from buffer
+
+
+def setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+def process_labels(
+    item_data, prob, pred_label, labels_all, child_to_parent, label_to_index
+):
+    """Optimized label processing"""
+    labels_indexes = pred_label.tolist()
+
+    # Use set for faster lookups
+    active_labels = set()
+    for i, is_active in enumerate(labels_indexes):
+        if is_active == 1:
+            label = labels_all[i]
+            active_labels.add(label)
+            if label in child_to_parent:
+                active_labels.add(child_to_parent[label])
+
+    item_data["registers"] = list(active_labels)
+    item_data["register_probabilities"] = [round(float(p), 4) for p in prob.tolist()]
+    return item_data
 
 
 def batch_process(
