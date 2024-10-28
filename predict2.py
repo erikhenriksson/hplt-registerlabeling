@@ -122,53 +122,49 @@ def batch_process(
 
     processed_count = 0
 
-    # Enable automatic mixed precision
-    scaler = torch.cuda.amp.GradScaler()
-
     while True:
+        # Get a large batch of data
         large_batch = list(islice(data_iterator, max_batch_length))
         if not large_batch:
             break
 
+        # Parse JSON and extract texts in batch
         text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
         texts = [item[1]["text"] for item in text_data]
 
+        # Batch tokenization
         encodings = tokenizer(
             texts, truncation=True, max_length=512, padding=False, return_tensors=None
         )
 
+        # Sort by length for efficient batching
         lengths = [len(ids) for ids in encodings["input_ids"]]
         sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
 
         processed_results = []
 
+        # Process in sorted batches
         for i in range(0, len(sorted_indices), batch_size):
             batch_indices = sorted_indices[i : i + batch_size]
 
+            # Collect batch items
             batch_items = [text_data[idx][1] for idx in batch_indices]
             batch_encodings = {
                 key: [encodings[key][idx] for idx in batch_indices]
                 for key in encodings.keys()
             }
 
+            # Pad only within similar-length batches
             batch_tokens = tokenizer.pad(
                 batch_encodings, padding=True, return_tensors="pt"
             ).to(device)
 
-            # Use autocast for mixed precision
             with torch.no_grad():
-                batch_tokens = {
-                    k: v.to(dtype=torch.float16) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch_tokens.items()
-                }
                 outputs = model(**batch_tokens)
-                # Cast outputs back to float32 for sigmoid
-                if isinstance(outputs.logits, torch.Tensor):
-                    outputs.logits = outputs.logits.float()
-
                 probabilities = sigmoid(outputs.logits)
                 predicted_labels = (probabilities > 0.5).int()
 
+            # Process results
             for orig_idx, (item_data, prob, pred_label) in enumerate(
                 zip(batch_items, probabilities, predicted_labels)
             ):
@@ -186,6 +182,7 @@ def batch_process(
             if processed_count % 1000 == 0:
                 print(f"GPU {rank}: Processed {processed_count} items")
 
+        # Sort back to original order and yield
         processed_results.sort(key=lambda x: x[0])
         yield [item for _, item in processed_results]
 
@@ -194,6 +191,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
+    # Get total lines count
     if rank == 0:
         total_lines = count_lines_in_zst(cfg.input_path)
         print(f"Total lines to process: {total_lines}")
@@ -214,14 +212,16 @@ def process_and_save_ddp(rank, cfg, world_size):
         config = json.load(config_file)
     tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
 
+    # Create temporary file for this rank
     temp_output_path = f"{cfg.output_path}.temp_{rank}"
 
     start_time = time.time()
     print(f"GPU {rank}: Starting processing")
 
+    # Optimized writing with buffering
     WRITE_BUFFER_SIZE = 1024 * 1024  # 1MB buffer
     with open(temp_output_path, "wb", buffering=WRITE_BUFFER_SIZE) as out_file:
-        cctx = zstd.ZstdCompressor(level=3)
+        cctx = zstd.ZstdCompressor(level=3)  # Balance between compression and speed
         with cctx.stream_writer(out_file) as writer:
             buffer = []
             for processed_batch in batch_process(
@@ -240,6 +240,7 @@ def process_and_save_ddp(rank, cfg, world_size):
                     writer.write("".join(lines).encode("utf-8"))
                     buffer = []
 
+            # Write remaining items
             if buffer:
                 lines = [json.dumps(item) + "\n" for item in buffer]
                 writer.write("".join(lines).encode("utf-8"))
@@ -247,8 +248,10 @@ def process_and_save_ddp(rank, cfg, world_size):
     end_time = time.time()
     print(f"GPU {rank}: Finished processing in {end_time - start_time:.2f} seconds")
 
+    # Synchronize before combining results
     dist.barrier()
 
+    # Only rank 0 combines the results
     if rank == 0:
         print("Combining results from all GPUs...")
         with open(cfg.output_path, "wb", buffering=WRITE_BUFFER_SIZE) as final_out:
