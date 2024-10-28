@@ -132,7 +132,9 @@ def process_and_save_ddp(rank, cfg, world_size):
         device
     )
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
+    with open(f"{cfg.model_path}/config.json", "r") as config_file:
+        config = json.load(config_file)
+    tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
 
     start_time = time.time()
     print("Start")
