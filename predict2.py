@@ -79,6 +79,7 @@ def batch_process(
 
         processed_results = []
         for i in range(0, len(text_data), batch_size):
+            print("Processing batch", i)
             batch = text_data[i : i + batch_size]
             batch_indices = [item[0] for item in batch]
             batch_items = [item[1] for item in batch]
@@ -129,7 +130,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
     )
-    model = DDP(model, device_ids=[rank])  # Wrap model in DDP
+    model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
 
     start_time = time.time()
@@ -158,8 +159,8 @@ def process_and_save_ddp(rank, cfg, world_size):
 # Main function to run with torch.multiprocessing.spawn
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--max_batch_length", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--max_batch_length", type=int, default=2000)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/en/1_sample.jsonl.zst")
     parser.add_argument(
