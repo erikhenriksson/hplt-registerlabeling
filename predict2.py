@@ -37,36 +37,15 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
-def estimate_lines_in_zst(file_path, sample_size=100 * 1024 * 1024):  # 100MB sample
-    """Estimate total lines by sampling the file"""
-    total_size = os.path.getsize(file_path)
-
-    # Read a sample of the compressed file
+def count_lines_in_zst(file_path):
+    count = 0
     with open(file_path, "rb") as f:
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(f) as reader:
-            # Read first chunk to get compression ratio
-            sample = reader.read(sample_size)
-            sample_text = sample.decode("utf-8")
-
-            # Count lines in sample
-            sample_lines = sample_text.count("\n")
-
-            # Get decompressed size of sample
-            decompressed_sample_size = len(sample_text.encode("utf-8"))
-
-            # Calculate compression ratio
-            compression_ratio = decompressed_sample_size / sample_size
-
-            # Estimate total decompressed size
-            estimated_total_decompressed = total_size * compression_ratio
-
-            # Estimate total lines
-            lines_per_byte = sample_lines / decompressed_sample_size
-            estimated_total_lines = int(estimated_total_decompressed * lines_per_byte)
-
-            # Add some padding for safety
-            return int(estimated_total_lines * 1.1)  # Add 10% padding
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            for _ in text_stream:
+                count += 1
+    return count
 
 
 def local_data(file_path, rank, world_size, total_lines):
@@ -164,7 +143,6 @@ def batch_process(
         text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
         texts = [item[1]["text"] for item in text_data]
 
-        # Batch tokenize on CPU
         encodings = tokenizer(
             texts,
             truncation=True,
@@ -191,23 +169,21 @@ def batch_process(
             # Get the maximum length in this batch
             current_length = max(len(seq) for seq in batch_encodings["input_ids"])
 
-            # Manually create padded tensors
-            input_ids = torch.zeros(
-                (current_batch_size, current_length), dtype=torch.long
-            )
-            attention_mask = torch.zeros(
-                (current_batch_size, current_length), dtype=torch.long
-            )
+            # Reset buffers to zero
+            input_ids_buffer.zero_()
+            attention_mask_buffer.zero_()
 
-            # Fill the tensors with actual values
+            # Fill the pre-allocated buffers
             for j, seq in enumerate(batch_encodings["input_ids"]):
                 seq_len = len(seq)
-                input_ids[j, :seq_len] = torch.tensor(seq, dtype=torch.long)
-                attention_mask[j, :seq_len] = 1
+                input_ids_buffer[j, :seq_len].copy_(
+                    torch.tensor(seq, dtype=torch.long, device=device)
+                )
+                attention_mask_buffer[j, :seq_len] = 1
 
-            # Move to GPU
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
+            # Use views of the buffers for the current batch
+            input_ids = input_ids_buffer[:current_batch_size, :current_length]
+            attention_mask = attention_mask_buffer[:current_batch_size, :current_length]
 
             with torch.no_grad():
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -228,7 +204,6 @@ def batch_process(
                 processed_results.append((batch_indices[orig_idx], processed_item))
                 processed_count += 1
 
-            # Update progress bar
             if rank == 0 and pbar is not None:
                 pbar.update(current_batch_size)
 
