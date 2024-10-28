@@ -37,23 +37,15 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
-def count_lines_in_zst(file_path):
-    count = 0
-    with open(file_path, "rb") as f:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(f) as reader:
-            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-            for _ in text_stream:
-                count += 1
-    return count
-
-
 def local_data_adaptive(file_path, rank, world_size, chunk_size_mb=1024):
     """Process data in chunks without knowing total line count"""
     file_size = os.path.getsize(file_path)
     chunk_size = file_size // world_size
     start_pos = rank * chunk_size
     end_pos = start_pos + chunk_size if rank != world_size - 1 else file_size
+
+    buffer = []
+    BUFFER_SIZE = 1000
 
     with open(file_path, "rb") as file:
         file.seek(start_pos)
@@ -67,37 +59,19 @@ def local_data_adaptive(file_path, rank, world_size, chunk_size_mb=1024):
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
 
             while file.tell() < end_pos:
-                line = text_reader.readline()
-                if not line:
-                    break
-                yield line
-
-
-def local_data(file_path, rank, world_size, total_lines):
-    """Optimized data loading with buffering"""
-    chunk_size = total_lines // world_size
-    start_line = rank * chunk_size
-    end_line = start_line + chunk_size if rank != world_size - 1 else total_lines
-
-    buffer = []
-    BUFFER_SIZE = 1000
-
-    current_line = 0
-    with open(file_path, "rb") as file:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(file) as reader:
-            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
-            for line in text_reader:
-                if start_line <= current_line < end_line:
+                try:
+                    line = text_reader.readline()
+                    if not line:
+                        break
                     buffer.append(line)
                     if len(buffer) >= BUFFER_SIZE:
                         yield from buffer
                         buffer = []
-                elif current_line >= end_line:
-                    break
-                current_line += 1
+                except Exception as e:
+                    print(f"Error reading line: {e}")
+                    continue
 
-            if buffer:
+            if buffer:  # Yield remaining items
                 yield from buffer
 
 
@@ -136,18 +110,12 @@ def batch_process(
     model,
     tokenizer,
     input_path,
-    # total_lines,
     batch_size=128,
     max_batch_length=12800,
 ):
-    data_iterator = local_data_adaptive(input_path, rank, world_size, total_lines)
+    data_iterator = local_data_adaptive(input_path, rank, world_size)
     device = torch.device(f"cuda:{rank}")
     model.to(device)
-
-    # Set up progress bar
-    pbar = None
-    if rank == 0:
-        pbar = tqdm(total=total_lines // world_size, desc=f"GPU {rank}")
 
     # Pre-allocate GPU memory for batch tensors
     max_length = 512
@@ -164,6 +132,9 @@ def batch_process(
         large_batch = list(islice(data_iterator, max_batch_length))
         if not large_batch:
             break
+
+        if rank == 0 and processed_count == 0:
+            print(f"GPU {rank}: Processing first batch of size {len(large_batch)}")
 
         text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
         texts = [item[1]["text"] for item in text_data]
@@ -229,30 +200,17 @@ def batch_process(
                 processed_results.append((batch_indices[orig_idx], processed_item))
                 processed_count += 1
 
-            if rank == 0 and pbar is not None:
-                pbar.update(current_batch_size)
+            if rank == 0 and processed_count % 1000 == 0:
+                print(f"GPU {rank}: Processed {processed_count} items")
 
         processed_results.sort(key=lambda x: x[0])
         yield [item for _, item in processed_results]
-
-    if rank == 0 and pbar is not None:
-        pbar.close()
 
 
 def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-    """
-    if rank == 0:
-        total_lines = count_lines_in_zst(cfg.input_path)
-        print(f"Total lines to process: {total_lines}")
-    else:
-        total_lines = None
 
-    total_lines = torch.tensor(total_lines if total_lines is not None else 0).to(device)
-    dist.broadcast(total_lines, src=0)
-    total_lines = total_lines.item()
-    """
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
     )
@@ -283,7 +241,6 @@ def process_and_save_ddp(rank, cfg, world_size):
                 model,
                 tokenizer,
                 cfg.input_path,
-                # total_lines,
                 cfg.batch_size,
                 cfg.max_batch_length,
             ):
