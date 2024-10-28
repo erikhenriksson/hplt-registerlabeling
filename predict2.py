@@ -124,6 +124,7 @@ def batch_process(
 
 # Process and save function
 def process_and_save_ddp(rank, cfg, world_size):
+    print("Begin")
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
