@@ -41,22 +41,39 @@ label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
 def local_data_adaptive(file_path, rank, world_size):
-    """Process data while preserving original line order"""
-    CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+    """Process data while preserving original line order with proper cleanup"""
+    buffer = []
+    BUFFER_SIZE = 1000
     line_count = 0
 
+    # Use context managers for proper resource cleanup
     with open(file_path, "rb") as file:
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(file) as reader:
             text_stream = io.TextIOWrapper(reader, encoding="utf-8")
             while True:
-                line = text_stream.readline()
-                if not line:
+                try:
+                    line = text_stream.readline()
+                    if not line:
+                        break
+
+                    if line_count % world_size == rank:
+                        buffer.append((line_count, line))
+                        if len(buffer) >= BUFFER_SIZE:
+                            for item in buffer:
+                                yield item
+                            buffer.clear()  # Explicitly clear buffer
+                    line_count += 1
+
+                except Exception as e:
+                    print(f"Error reading line {line_count}: {e}")
                     break
 
-                if line_count % world_size == rank:
-                    yield (line_count, line)
-                line_count += 1
+            # Yield remaining items
+            if buffer:
+                for item in buffer:
+                    yield item
+                buffer.clear()
 
 
 def setup(rank, world_size):
@@ -111,121 +128,144 @@ def batch_process(
 
     processed_count = 0
 
-    while True:
-        # Process data in smaller chunks to avoid memory accumulation
-        current_batch = []
-        for _ in range(max_batch_length):
-            try:
-                item = next(data_iterator)
-                current_batch.append(item)
-            except StopIteration:
-                if not current_batch:
-                    return
+    try:
+        while True:
+            # Get batch with explicit size limit
+            large_batch = []
+            for _ in range(max_batch_length):
+                try:
+                    item = next(data_iterator)
+                    large_batch.append(item)
+                except StopIteration:
+                    break
+
+            if not large_batch:
                 break
 
-        # Process positions and lines immediately
-        positions = []
-        text_data = []
-        for pos, line in current_batch:
-            positions.append(pos)
-            # Parse JSON immediately and only keep what we need
-            parsed = json.loads(line)
-            text_data.append(
-                (pos, {"text": parsed["text"]})
-            )  # Only keep necessary fields
+            # Process the batch in chunks to manage memory
+            for chunk_start in range(0, len(large_batch), 1000):
+                chunk = large_batch[chunk_start : chunk_start + 1000]
 
-        current_batch = None  # Clear the raw data immediately
+                # Unpack chunk data
+                positions, lines = zip(*chunk)
+                chunk_data = []
+                for pos, line in zip(positions, lines):
+                    try:
+                        parsed = json.loads(line)
+                        chunk_data.append((pos, parsed))
+                    except json.JSONDecodeError:
+                        continue
 
-        texts = [item[1]["text"] for item in text_data]
+                if not chunk_data:
+                    continue
 
-        # Get encodings for current batch
-        encodings = tokenizer(
-            texts,
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-            return_tensors=None,
-        )
+                text_data = chunk_data
+                texts = [item[1]["text"] for item in text_data]
 
-        texts = None  # Clear texts after encoding
-
-        lengths = [len(ids) for ids in encodings["input_ids"]]
-        sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
-        lengths = None  # Clear lengths array
-
-        processed_results = []
-
-        # Process in smaller batches
-        for i in range(0, len(sorted_indices), batch_size):
-            current_batch_size = min(batch_size, len(sorted_indices) - i)
-            batch_indices = sorted_indices[i : i + current_batch_size]
-
-            # Create minimal batch items
-            batch_items = [text_data[idx][1] for idx in batch_indices]
-            batch_positions = [text_data[idx][0] for idx in batch_indices]
-
-            # Only keep necessary encoding data for current batch
-            batch_encodings = {
-                key: [encodings[key][idx] for idx in batch_indices]
-                for key in encodings.keys()
-            }
-
-            current_length = max(len(seq) for seq in batch_encodings["input_ids"])
-
-            # Reset buffers
-            input_ids_buffer.zero_()
-            attention_mask_buffer.zero_()
-
-            # Fill buffers
-            for j, seq in enumerate(batch_encodings["input_ids"]):
-                seq_len = len(seq)
-                input_ids_buffer[j, :seq_len].copy_(
-                    torch.tensor(seq, dtype=torch.long, device=device)
+                # Process encodings in smaller chunks
+                encodings = tokenizer(
+                    texts,
+                    truncation=True,
+                    max_length=max_length,
+                    padding=False,
+                    return_tensors=None,
                 )
-                attention_mask_buffer[j, :seq_len] = 1
 
-            input_ids = input_ids_buffer[:current_batch_size, :current_length]
-            attention_mask = attention_mask_buffer[:current_batch_size, :current_length]
+                # Clear text data
+                texts = None
 
-            with torch.no_grad():
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                probabilities = sigmoid(outputs.logits)
-                predicted_labels = (probabilities > 0.5).int()
+                lengths = [len(ids) for ids in encodings["input_ids"]]
+                sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
 
-                # Process each item individually to avoid accumulating large lists
-                for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
-                    zip(batch_items, probabilities, predicted_labels, batch_positions)
-                ):
-                    processed_item = process_labels(
-                        item_data.copy(),
-                        prob.cpu(),
-                        pred_label.cpu(),
-                        labels_all,
-                        child_to_parent,
-                        label_to_index,
+                processed_results = []
+
+                # Process in smaller batches
+                for i in range(0, len(sorted_indices), batch_size):
+                    current_batch_size = min(batch_size, len(sorted_indices) - i)
+                    batch_indices = sorted_indices[i : i + current_batch_size]
+
+                    batch_items = [text_data[idx][1] for idx in batch_indices]
+                    batch_positions = [text_data[idx][0] for idx in batch_indices]
+
+                    # Create batch encodings with explicit cleanup
+                    batch_encodings = {
+                        key: [encodings[key][idx] for idx in batch_indices]
+                        for key in encodings.keys()
+                    }
+
+                    current_length = max(
+                        len(seq) for seq in batch_encodings["input_ids"]
                     )
-                    processed_results.append((orig_pos, processed_item))
-                    processed_count += 1
 
-            # Clear batch data explicitly
-            batch_items = None
-            batch_positions = None
-            batch_encodings = None
+                    input_ids_buffer.zero_()
+                    attention_mask_buffer.zero_()
 
-            if rank == 0 and processed_count % 1000 == 0:
-                print(f"GPU {rank}: Processed {processed_count} items")
+                    for j, seq in enumerate(batch_encodings["input_ids"]):
+                        seq_len = len(seq)
+                        input_ids_buffer[j, :seq_len].copy_(
+                            torch.tensor(seq, dtype=torch.long, device=device)
+                        )
+                        attention_mask_buffer[j, :seq_len] = 1
 
-        # Sort and yield results
-        processed_results.sort(key=lambda x: x[0])
-        yield processed_results
+                    input_ids = input_ids_buffer[:current_batch_size, :current_length]
+                    attention_mask = attention_mask_buffer[
+                        :current_batch_size, :current_length
+                    ]
 
-        # Clear all batch-related data
-        text_data = None
-        encodings = None
-        sorted_indices = None
-        processed_results = None
+                    with torch.no_grad():
+                        outputs = model(
+                            input_ids=input_ids, attention_mask=attention_mask
+                        )
+                        probabilities = sigmoid(outputs.logits)
+                        predicted_labels = (probabilities > 0.5).int()
 
-    print(f"GPU {rank}: Completed processing {processed_count} items")
+                        # Process results immediately and clear GPU tensors
+                        for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
+                            zip(
+                                batch_items,
+                                probabilities,
+                                predicted_labels,
+                                batch_positions,
+                            )
+                        ):
+                            processed_item = process_labels(
+                                item_data.copy(),
+                                prob.cpu(),
+                                pred_label.cpu(),
+                                labels_all,
+                                child_to_parent,
+                                label_to_index,
+                            )
+                            processed_results.append((orig_pos, processed_item))
+                            processed_count += 1
+
+                        del outputs, probabilities, predicted_labels
+
+                    del batch_encodings
+                    del input_ids
+                    del attention_mask
+
+                    if rank == 0 and processed_count % 1000 == 0:
+                        print(f"GPU {rank}: Processed {processed_count} items")
+
+                # Yield results for this chunk
+                processed_results.sort(key=lambda x: x[0])
+                yield processed_results
+
+                # Clear chunk data
+                del chunk_data
+                del encodings
+                del processed_results
+
+            # Clear batch data
+            del large_batch
+
+    except Exception as e:
+        print(f"Error in batch processing on rank {rank}: {e}")
+        raise
+
+    finally:
+        print(f"GPU {rank}: Completed processing {processed_count} items")
 
 
 class OrderedFileReader:
