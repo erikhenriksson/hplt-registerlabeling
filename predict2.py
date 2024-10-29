@@ -176,9 +176,10 @@ def reload_model(rank, model_path, device):
     """Reload model to combat memory fragmentation"""
     torch.cuda.empty_cache()
     gc.collect()
-    new_model = AutoModelForSequenceClassification.from_pretrained(model_path).to(
-        device
-    )
+    new_model = AutoModelForSequenceClassification.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
     new_model = DDP(new_model, device_ids=[rank], find_unused_parameters=False)
     torch.cuda.empty_cache()
     return new_model
