@@ -103,7 +103,6 @@ def batch_process(
     device = torch.device(f"cuda:{rank}")
     model.to(device)
 
-    # Pre-allocate GPU memory for batch tensors
     max_length = 512
     input_ids_buffer = torch.zeros(
         (batch_size, max_length), dtype=torch.long, device=device
@@ -119,10 +118,9 @@ def batch_process(
         if not large_batch:
             break
 
-        if rank == 0 and processed_count == 0:
-            print(f"GPU {rank}: Processing first batch of size {len(large_batch)}")
-
-        text_data = [(idx, json.loads(line)) for idx, line in enumerate(large_batch)]
+        # Unpack the position and line data
+        positions, lines = zip(*large_batch)
+        text_data = [(idx, json.loads(line)) for idx, line in zip(positions, lines)]
         texts = [item[1]["text"] for item in text_data]
 
         encodings = tokenizer(
@@ -143,6 +141,7 @@ def batch_process(
             batch_indices = sorted_indices[i : i + current_batch_size]
 
             batch_items = [text_data[idx][1] for idx in batch_indices]
+            batch_positions = [text_data[idx][0] for idx in batch_indices]
             batch_encodings = {
                 key: [encodings[key][idx] for idx in batch_indices]
                 for key in encodings.keys()
@@ -172,8 +171,8 @@ def batch_process(
                 probabilities = sigmoid(outputs.logits)
                 predicted_labels = (probabilities > 0.5).int()
 
-            for orig_idx, (item_data, prob, pred_label) in enumerate(
-                zip(batch_items, probabilities, predicted_labels)
+            for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
+                zip(batch_items, probabilities, predicted_labels, batch_positions)
             ):
                 processed_item = process_labels(
                     item_data.copy(),
@@ -183,14 +182,17 @@ def batch_process(
                     child_to_parent,
                     label_to_index,
                 )
-                processed_results.append((batch_indices[orig_idx], processed_item))
+                processed_results.append((orig_pos, processed_item))
                 processed_count += 1
 
             if rank == 0 and processed_count % 1000 == 0:
                 print(f"GPU {rank}: Processed {processed_count} items")
 
+        # Sort by original position before yielding
         processed_results.sort(key=lambda x: x[0])
-        yield [item for _, item in processed_results]
+        yield processed_results
+
+    print(f"GPU {rank}: Completed processing {processed_count} items")
 
 
 class OrderedFileReader:
@@ -289,6 +291,22 @@ def merge_ordered_files(temp_files, output_path, buffer_size=8 * 1024 * 1024):
     # Close and cleanup readers
     for reader in readers:
         reader.close()
+
+
+def get_zstd_compression_level(file_path):
+    """Detect the compression level of a zstd file"""
+    with open(file_path, "rb") as f:
+        # Read frame header
+        header = f.read(4)
+        if header.startswith(b"\x28\xB5\x2F\xFD"):  # zstd magic number
+            # Read frame header descriptor
+            frame_header = f.read(1)[0]
+            # Extract compression level
+            level = (frame_header >> 3) & 0x1F
+            return level
+        else:
+            print("Warning: Could not detect compression level, using default")
+            return None
 
 
 def process_and_save_ddp(rank, cfg, world_size):
