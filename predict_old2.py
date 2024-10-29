@@ -14,6 +14,7 @@ from itertools import islice
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import gc
 
 # Enable TF32
 torch.set_float32_matmul_precision("high")
