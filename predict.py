@@ -51,17 +51,22 @@ def local_data_adaptive(file_path, rank, world_size):
         with dctx.stream_reader(file) as reader:
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
 
-            for line in text_reader:
-                if line_count % world_size == rank:
-                    # Store original position with the line
-                    buffer.append((line_count, line))
-                    if len(buffer) >= BUFFER_SIZE:
-                        yield from buffer
-                        buffer = []
-                line_count += 1
+            try:
+                for line in text_reader:
+                    if line_count % world_size == rank:
+                        # Store original position with the line
+                        buffer.append((line_count, line))
+                        if len(buffer) >= BUFFER_SIZE:
+                            yield from buffer
+                            buffer.clear()  # Explicitly clear buffer
+                    line_count += 1
 
-            if buffer:
-                yield from buffer
+                if buffer:
+                    yield from buffer
+            finally:
+                # Ensure cleanup
+                buffer.clear()
+                del buffer
 
 
 def setup(rank, world_size):
@@ -107,93 +112,107 @@ def batch_process(
     model.to(device)
 
     max_length = 512
-    input_ids_buffer = torch.zeros(
-        (batch_size, max_length), dtype=torch.long, device=device
-    )
-    attention_mask_buffer = torch.zeros(
-        (batch_size, max_length), dtype=torch.long, device=device
-    )
-
     processed_count = 0
 
     while True:
-        large_batch = list(islice(data_iterator, max_batch_length))
-        if not large_batch:
-            break
+        try:
+            # Clear any accumulated memory
+            torch.cuda.empty_cache()
 
-        # Unpack the position and line data
-        positions, lines = zip(*large_batch)
-        text_data = [(idx, json.loads(line)) for idx, line in zip(positions, lines)]
-        texts = [item[1]["text"] for item in text_data]
+            large_batch = list(islice(data_iterator, max_batch_length))
+            if not large_batch:
+                break
 
-        encodings = tokenizer(
-            texts,
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-            return_tensors=None,
-        )
+            # Unpack the position and line data
+            positions, lines = zip(*large_batch)
+            text_data = [(idx, json.loads(line)) for idx, line in zip(positions, lines)]
+            texts = [item[1]["text"] for item in text_data]
 
-        lengths = [len(ids) for ids in encodings["input_ids"]]
-        sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+            # Create encodings and immediately convert to tensors
+            encodings = tokenizer(
+                texts,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                return_tensors=None,
+            )
 
-        processed_results = []
+            lengths = [len(ids) for ids in encodings["input_ids"]]
+            sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
 
-        for i in range(0, len(sorted_indices), batch_size):
-            current_batch_size = min(batch_size, len(sorted_indices) - i)
-            batch_indices = sorted_indices[i : i + current_batch_size]
+            processed_results = []
 
-            batch_items = [text_data[idx][1] for idx in batch_indices]
-            batch_positions = [text_data[idx][0] for idx in batch_indices]
-            batch_encodings = {
-                key: [encodings[key][idx] for idx in batch_indices]
-                for key in encodings.keys()
-            }
+            # Process in smaller chunks to avoid memory issues
+            for i in range(0, len(sorted_indices), batch_size):
+                # Clear cache before each chunk
+                torch.cuda.empty_cache()
 
-            # Get the maximum length in this batch
-            current_length = max(len(seq) for seq in batch_encodings["input_ids"])
+                current_batch_size = min(batch_size, len(sorted_indices) - i)
+                batch_indices = sorted_indices[i : i + current_batch_size]
 
-            # Reset buffers to zero
-            input_ids_buffer.zero_()
-            attention_mask_buffer.zero_()
-
-            # Fill the pre-allocated buffers
-            for j, seq in enumerate(batch_encodings["input_ids"]):
-                seq_len = len(seq)
-                input_ids_buffer[j, :seq_len].copy_(
-                    torch.tensor(seq, dtype=torch.long, device=device)
+                # Create new buffers for each batch instead of reusing
+                current_length = max(
+                    len(encodings["input_ids"][idx]) for idx in batch_indices
                 )
-                attention_mask_buffer[j, :seq_len] = 1
-
-            # Use views of the buffers for the current batch
-            input_ids = input_ids_buffer[:current_batch_size, :current_length]
-            attention_mask = attention_mask_buffer[:current_batch_size, :current_length]
-
-            with torch.no_grad():
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                probabilities = sigmoid(outputs.logits)
-                predicted_labels = (probabilities > 0.5).int()
-
-            for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
-                zip(batch_items, probabilities, predicted_labels, batch_positions)
-            ):
-                processed_item = process_labels(
-                    item_data.copy(),
-                    prob,
-                    pred_label,
-                    labels_all,
-                    child_to_parent,
-                    label_to_index,
+                input_ids = torch.zeros(
+                    (current_batch_size, current_length),
+                    dtype=torch.long,
+                    device=device,
                 )
-                processed_results.append((orig_pos, processed_item))
-                processed_count += 1
+                attention_mask = torch.zeros(
+                    (current_batch_size, current_length),
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                # Fill tensors
+                for j, idx in enumerate(batch_indices):
+                    seq = encodings["input_ids"][idx]
+                    seq_len = len(seq)
+                    input_ids[j, :seq_len] = torch.tensor(
+                        seq, dtype=torch.long, device=device
+                    )
+                    attention_mask[j, :seq_len] = 1
+
+                with torch.inference_mode():
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    probabilities = sigmoid(outputs.logits)
+                    predicted_labels = (probabilities > 0.5).int()
+
+                batch_items = [text_data[idx][1] for idx in batch_indices]
+                batch_positions = [text_data[idx][0] for idx in batch_indices]
+
+                for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
+                    zip(batch_items, probabilities, predicted_labels, batch_positions)
+                ):
+                    processed_item = process_labels(
+                        item_data.copy(),
+                        prob,
+                        pred_label,
+                        labels_all,
+                        child_to_parent,
+                        label_to_index,
+                    )
+                    processed_results.append((orig_pos, processed_item))
+                    processed_count += 1
+
+                # Explicitly delete tensors
+                del input_ids, attention_mask, outputs, probabilities, predicted_labels
 
             if rank == 0 and processed_count % 1000 == 0:
-                print(f"GPU {rank}: Processed {processed_count} items")
+                print(
+                    f"GPU {rank}: Processed {processed_count} items, Memory: {torch.cuda.memory_allocated(device)/1024**3:.2f}GB"
+                )
 
-        # Sort by original position before yielding
-        processed_results.sort(key=lambda x: x[0])
-        yield processed_results
+            # Clear references before next batch
+            del texts, encodings, lengths, sorted_indices
+            processed_results.sort(key=lambda x: x[0])
+            yield processed_results
+            del processed_results
+
+        except Exception as e:
+            print(f"Error in batch processing on GPU {rank}: {str(e)}")
+            raise e
 
     print(f"GPU {rank}: Completed processing {processed_count} items")
 
@@ -300,79 +319,85 @@ def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
-        device
-    )
-
-    # Add torch.compile() - this is the new part
-    # if hasattr(torch, "compile"):  # Check if using PyTorch 2.0+
-    #    model = torch.compile(model)
-    #    if rank == 0:
-    #        print("Using torch.compile() for optimization")
-
-    model = DDP(model, device_ids=[rank], find_unused_parameters=False)
-
-    with open(f"{cfg.model_path}/config.json", "r") as config_file:
-        config = json.load(config_file)
-    tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
-
-    temp_output_path = f"{cfg.output_path}.temp_{rank}"
-
-    start_time = time.time()
+    # Print initial memory state
     if rank == 0:
-        print(f"Starting processing on {world_size} GPUs")
+        print(
+            f"Initial GPU memory: {torch.cuda.memory_allocated(device)/1024**3:.2f}GB"
+        )
 
-    # Optimized writing with large buffers
-    WRITE_BUFFER_SIZE = 8 * 1024 * 1024  # 8MB buffer
-    string_buffer = []
-    string_buffer_size = 0
-    MAX_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
+            device
+        )
+        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
-    with open(temp_output_path, "wb", buffering=WRITE_BUFFER_SIZE) as out_file:
-        cctx = zstd.ZstdCompressor(level=1)
-        with cctx.stream_writer(out_file) as writer:
-            for processed_batch in batch_process(
-                rank,
-                world_size,
-                model,
-                tokenizer,
-                cfg.input_path,
-                cfg.batch_size,
-                cfg.max_batch_length,
-            ):
-                # Sort batch by original position before writing
-                processed_batch.sort(key=lambda x: x[0])
+        with open(f"{cfg.model_path}/config.json", "r") as config_file:
+            config = json.load(config_file)
+        tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
 
-                for orig_pos, item in processed_batch:
-                    output_item = {"original_position": orig_pos, "data": item}
-                    json_str = json.dumps(output_item) + "\n"
-                    string_buffer.append(json_str)
-                    string_buffer_size += len(json_str)
+        temp_output_path = f"{cfg.output_path}.temp_{rank}"
 
-                    if string_buffer_size >= MAX_BUFFER_SIZE:
-                        writer.write("".join(string_buffer).encode("utf-8"))
-                        string_buffer = []
-                        string_buffer_size = 0
+        start_time = time.time()
+        if rank == 0:
+            print(f"Starting processing on {world_size} GPUs")
 
-            if string_buffer:
-                writer.write("".join(string_buffer).encode("utf-8"))
+        # Optimized writing with large buffers
+        WRITE_BUFFER_SIZE = 8 * 1024 * 1024  # 8MB buffer
+        string_buffer = []
+        string_buffer_size = 0
+        MAX_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB
 
-    end_time = time.time()
-    print(f"GPU {rank}: Finished processing in {end_time - start_time:.2f} seconds")
+        with open(temp_output_path, "wb", buffering=WRITE_BUFFER_SIZE) as out_file:
+            cctx = zstd.ZstdCompressor(level=1)
+            with cctx.stream_writer(out_file) as writer:
+                for processed_batch in batch_process(
+                    rank,
+                    world_size,
+                    model,
+                    tokenizer,
+                    cfg.input_path,
+                    cfg.batch_size,
+                    cfg.max_batch_length,
+                ):
+                    # Sort batch by original position before writing
+                    processed_batch.sort(key=lambda x: x[0])
 
-    dist.barrier()
+                    for orig_pos, item in processed_batch:
+                        output_item = {"original_position": orig_pos, "data": item}
+                        json_str = json.dumps(output_item) + "\n"
+                        string_buffer.append(json_str)
+                        string_buffer_size += len(json_str)
 
-    if rank == 0:
-        print("Combining results from all GPUs...")
-        temp_files = [f"{cfg.output_path}.temp_{r}" for r in range(world_size)]
-        merge_ordered_files(temp_files, cfg.output_path)
-        print("Results combined successfully!")
+                        if string_buffer_size >= MAX_BUFFER_SIZE:
+                            writer.write("".join(string_buffer).encode("utf-8"))
+                            string_buffer = []
+                            string_buffer_size = 0
 
-        # Clean up temp files
-        for temp_file in temp_files:
-            os.remove(temp_file)
+                if string_buffer:
+                    writer.write("".join(string_buffer).encode("utf-8"))
 
-    cleanup()
+        end_time = time.time()
+        print(f"GPU {rank}: Finished processing in {end_time - start_time:.2f} seconds")
+
+        dist.barrier()
+
+        if rank == 0:
+            print("Combining results from all GPUs...")
+            temp_files = [f"{cfg.output_path}.temp_{r}" for r in range(world_size)]
+            merge_ordered_files(temp_files, cfg.output_path)
+            print("Results combined successfully!")
+
+            # Clean up temp files
+            for temp_file in temp_files:
+                os.remove(temp_file)
+
+    except Exception as e:
+        print(f"Error on GPU {rank}: {str(e)}")
+        raise e
+    finally:
+        # Cleanup
+        torch.cuda.empty_cache()
+        cleanup()
 
 
 def main():
