@@ -300,9 +300,10 @@ def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path,).to(
-        device
-    )
+    model = AutoModelForSequenceClassification.from_pretrained(
+        cfg.model_path,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
 
     # Add torch.compile() - this is the new part
     # if hasattr(torch, "compile"):  # Check if using PyTorch 2.0+
