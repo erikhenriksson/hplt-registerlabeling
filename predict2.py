@@ -456,9 +456,10 @@ def process_and_save_ddp(rank, cfg, world_size):
         )
 
     try:
-        model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
-            device
-        )
+        model = AutoModelForSequenceClassification.from_pretrained(
+            cfg.model_path,
+            torch_dtype=torch.bfloat16,
+        ).to(device)
         model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
         with open(f"{cfg.model_path}/config.json", "r") as config_file:
