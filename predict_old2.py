@@ -210,7 +210,6 @@ def batch_process(
             if rank == 0 and processed_count % 1000 == 0:
                 print(f"GPU {rank}: Processed {processed_count} items")
                 # Force garbage collection after each batch
-                import gc
 
                 gc.collect()
                 torch.cuda.empty_cache()
