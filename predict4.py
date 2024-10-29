@@ -299,9 +299,14 @@ def process_and_save_ddp(rank, cfg, world_size):
                 torch_dtype=torch.bfloat16,
             ).to(device)
             model = DDP(model, device_ids=[rank], find_unused_parameters=False)
-            tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
+            with open(f"{cfg.model_path}/config.json", "r") as config_file:
+                config = json.load(config_file)
+            tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
             processor = BatchProcessor(model, tokenizer, device)
+            start_time = time.time()
 
+            if rank == 0:
+                print(f"Starting processing on {world_size} GPUs")
             temp_output_path = f"{cfg.output_path}.temp_{rank}"
             processed_count = 0
 
@@ -360,6 +365,8 @@ def process_and_save_ddp(rank, cfg, world_size):
                         writer.write("".join(buffer).encode("utf-8"))
 
         dist.barrier()
+        end_time = time.time()
+        print(f"GPU {rank}: Finished processing in {end_time - start_time:.2f} seconds")
 
         if rank == 0:
             merge_ordered_files(
