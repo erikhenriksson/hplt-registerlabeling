@@ -15,6 +15,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# Enable TF32
+torch.set_float32_matmul_precision("high")
+
 # Labels structure
 labels_structure = {
     "MT": [],
@@ -302,10 +305,10 @@ def process_and_save_ddp(rank, cfg, world_size):
     )
 
     # Add torch.compile() - this is the new part
-    if hasattr(torch, "compile"):  # Check if using PyTorch 2.0+
-        model = torch.compile(model)
-        if rank == 0:
-            print("Using torch.compile() for optimization")
+    # if hasattr(torch, "compile"):  # Check if using PyTorch 2.0+
+    #    model = torch.compile(model)
+    #    if rank == 0:
+    #        print("Using torch.compile() for optimization")
 
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
