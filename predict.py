@@ -300,6 +300,13 @@ def process_and_save_ddp(rank, cfg, world_size):
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_path).to(
         device
     )
+
+    # Add torch.compile() - this is the new part
+    if hasattr(torch, "compile"):  # Check if using PyTorch 2.0+
+        model = torch.compile(model)
+        if rank == 0:
+            print("Using torch.compile() for optimization")
+
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
     with open(f"{cfg.model_path}/config.json", "r") as config_file:
