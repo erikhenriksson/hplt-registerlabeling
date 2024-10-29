@@ -293,22 +293,6 @@ def merge_ordered_files(temp_files, output_path, buffer_size=8 * 1024 * 1024):
         reader.close()
 
 
-def get_zstd_compression_level(file_path):
-    """Detect the compression level of a zstd file"""
-    with open(file_path, "rb") as f:
-        # Read frame header
-        header = f.read(4)
-        if header.startswith(b"\x28\xB5\x2F\xFD"):  # zstd magic number
-            # Read frame header descriptor
-            frame_header = f.read(1)[0]
-            # Extract compression level
-            level = (frame_header >> 3) & 0x1F
-            return level
-        else:
-            print("Warning: Could not detect compression level, using default")
-            return None
-
-
 def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
