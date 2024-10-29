@@ -38,7 +38,7 @@ label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
 def local_data_adaptive(file_path, rank, world_size):
-    """Process data by decompressing once and distributing chunks"""
+    """Process data while preserving original line order"""
     buffer = []
     BUFFER_SIZE = 1000
     line_count = 0
@@ -48,11 +48,10 @@ def local_data_adaptive(file_path, rank, world_size):
         with dctx.stream_reader(file) as reader:
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
 
-            # Read header line if it exists and distribute to all ranks
             for line in text_reader:
-                # Distribute lines based on remainder
                 if line_count % world_size == rank:
-                    buffer.append(line)
+                    # Store original position with the line
+                    buffer.append((line_count, line))
                     if len(buffer) >= BUFFER_SIZE:
                         yield from buffer
                         buffer = []
@@ -194,6 +193,104 @@ def batch_process(
         yield [item for _, item in processed_results]
 
 
+class OrderedFileReader:
+    """Helper class to read and track items from a file with their positions"""
+
+    def __init__(self, file_path):
+        self.file = open(file_path, "rb")
+        self.dctx = zstd.ZstdDecompressor()
+        self.reader = self.dctx.stream_reader(self.file)
+        self.text_reader = io.TextIOWrapper(self.reader, encoding="utf-8")
+        self.current_item = None
+        self.exhausted = False
+        self._read_next()
+
+    def _read_next(self):
+        try:
+            line = self.text_reader.readline()
+            if not line:
+                self.exhausted = True
+                self.current_item = None
+            else:
+                item = json.loads(line)
+                self.current_item = (item["original_position"], item["data"])
+        except Exception as e:
+            print(f"Error reading line: {e}")
+            self.exhausted = True
+            self.current_item = None
+
+    def get_current(self):
+        return self.current_item
+
+    def advance(self):
+        self._read_next()
+
+    def close(self):
+        self.text_reader.close()
+        self.reader.close()
+        self.file.close()
+
+
+def merge_ordered_files(temp_files, output_path, buffer_size=8 * 1024 * 1024):
+    """Merge multiple ordered files while maintaining global order"""
+    # Initialize readers for all temp files
+    readers = [OrderedFileReader(f) for f in temp_files]
+    active_readers = len(readers)
+
+    with open(output_path, "wb", buffering=buffer_size) as final_out:
+        cctx = zstd.ZstdCompressor(level=1)
+        with cctx.stream_writer(final_out) as final_writer:
+            output_position = 0
+            string_buffer = []
+            string_buffer_size = 0
+
+            while active_readers > 0:
+                # Find reader with smallest current position
+                min_pos = float("inf")
+                min_reader_idx = -1
+
+                for idx, reader in enumerate(readers):
+                    if not reader.exhausted:
+                        current = reader.get_current()
+                        if current and current[0] < min_pos:
+                            min_pos = current[0]
+                            min_reader_idx = idx
+
+                if min_reader_idx == -1:
+                    break
+
+                # Verify we're writing in correct order
+                assert (
+                    min_pos == output_position
+                ), f"Position mismatch: expected {output_position}, got {min_pos}"
+
+                # Write the item
+                pos, item = readers[min_reader_idx].get_current()
+                line = json.dumps(item) + "\n"
+                string_buffer.append(line)
+                string_buffer_size += len(line)
+
+                if string_buffer_size >= buffer_size:
+                    final_writer.write("".join(string_buffer).encode("utf-8"))
+                    string_buffer = []
+                    string_buffer_size = 0
+
+                # Advance the reader
+                readers[min_reader_idx].advance()
+                if readers[min_reader_idx].exhausted:
+                    active_readers -= 1
+
+                output_position += 1
+
+            # Write any remaining items
+            if string_buffer:
+                final_writer.write("".join(string_buffer).encode("utf-8"))
+
+    # Close and cleanup readers
+    for reader in readers:
+        reader.close()
+
+
 def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
@@ -220,7 +317,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     MAX_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB
 
     with open(temp_output_path, "wb", buffering=WRITE_BUFFER_SIZE) as out_file:
-        cctx = zstd.ZstdCompressor(level=1)  # Faster compression
+        cctx = zstd.ZstdCompressor(level=1)
         with cctx.stream_writer(out_file) as writer:
             for processed_batch in batch_process(
                 rank,
@@ -231,8 +328,12 @@ def process_and_save_ddp(rank, cfg, world_size):
                 cfg.batch_size,
                 cfg.max_batch_length,
             ):
-                for item in processed_batch:
-                    json_str = json.dumps(item) + "\n"
+                # Sort batch by original position before writing
+                processed_batch.sort(key=lambda x: x[0])
+
+                for orig_pos, item in processed_batch:
+                    output_item = {"original_position": orig_pos, "data": item}
+                    json_str = json.dumps(output_item) + "\n"
                     string_buffer.append(json_str)
                     string_buffer_size += len(json_str)
 
@@ -251,21 +352,13 @@ def process_and_save_ddp(rank, cfg, world_size):
 
     if rank == 0:
         print("Combining results from all GPUs...")
-        with open(cfg.output_path, "wb", buffering=WRITE_BUFFER_SIZE) as final_out:
-            cctx = zstd.ZstdCompressor(level=1)
-            with cctx.stream_writer(final_out) as final_writer:
-                for r in range(world_size):
-                    temp_file = f"{cfg.output_path}.temp_{r}"
-                    with open(temp_file, "rb") as temp_in:
-                        dctx = zstd.ZstdDecompressor()
-                        with dctx.stream_reader(temp_in) as reader:
-                            while True:
-                                chunk = reader.read(WRITE_BUFFER_SIZE)
-                                if not chunk:
-                                    break
-                                final_writer.write(chunk)
-                    os.remove(temp_file)
+        temp_files = [f"{cfg.output_path}.temp_{r}" for r in range(world_size)]
+        merge_ordered_files(temp_files, cfg.output_path)
         print("Results combined successfully!")
+
+        # Clean up temp files
+        for temp_file in temp_files:
+            os.remove(temp_file)
 
     cleanup()
 
