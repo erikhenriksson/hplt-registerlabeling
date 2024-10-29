@@ -1,10 +1,13 @@
 import os
+import gc
 import psutil
 import json
 import time
+import weakref
 import zstandard as zstd
 import io
 import torch
+from typing import Optional, Dict, List
 from tqdm.auto import tqdm
 from argparse import ArgumentParser
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -13,10 +16,9 @@ from itertools import islice
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from contextlib import contextmanager
 
 os.environ["HF_HOME"] = ".hf/hf_home"
-
-# Enable TF32
 torch.set_float32_matmul_precision("high")
 
 
@@ -31,6 +33,16 @@ def get_process_memory():
         ),  # File descriptors
         "threads": process.num_threads(),
     }
+
+
+def monitor_memory(rank: int, threshold_gb: float = 32.0) -> Dict:
+    """Monitor RAM usage and warn if it exceeds threshold"""
+    mem_info = get_process_memory()
+    if mem_info["rss"] > threshold_gb:
+        print(
+            f"WARNING: GPU {rank} - RAM usage ({mem_info['rss']:.2f}GB) exceeds threshold!"
+        )
+    return mem_info
 
 
 # Labels structure
@@ -55,31 +67,70 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
+class DataIterator:
+    def __init__(self, file_path: str, rank: int, world_size: int):
+        self.file_path = file_path
+        self.rank = rank
+        self.world_size = world_size
+        self._buffer: List = []
+        self._file: Optional[io.BufferedReader] = None
+        self._reader: Optional[io.TextIOWrapper] = None
+        self._line_count: int = 0
+        self._finalizer = weakref.finalize(self, self._cleanup)
+
+    def _cleanup(self):
+        """Cleanup resources"""
+        if self._reader:
+            self._reader.close()
+        if self._file:
+            self._file.close()
+        self._buffer.clear()
+
+    def __iter__(self):
+        self._file = open(self.file_path, "rb")
+        dctx = zstd.ZstdDecompressor()
+        reader = dctx.stream_reader(self._file)
+        self._reader = io.TextIOWrapper(reader, encoding="utf-8")
+        return self
+
+    def __next__(self):
+        try:
+            if not self._buffer:
+                # Read next chunk
+                for _ in range(1000):  # Buffer size
+                    line = self._reader.readline()
+                    if not line:
+                        if not self._buffer:
+                            raise StopIteration
+                        break
+
+                    if self._line_count % self.world_size == self.rank:
+                        self._buffer.append((self._line_count, line))
+                    self._line_count += 1
+
+            return self._buffer.pop(0)
+
+        except Exception as e:
+            self._cleanup()
+            raise e
+
+
 def local_data_adaptive(file_path, rank, world_size):
     """Process data while preserving original line order"""
-    buffer = []
-    BUFFER_SIZE = 1000
-    line_count = 0
+    return DataIterator(file_path, rank, world_size)
 
-    with open(file_path, "rb") as file:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(file) as reader:
-            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
 
-            try:
-                for line in text_reader:
-                    if line_count % world_size == rank:
-                        buffer.append((line_count, line))
-                        if len(buffer) >= BUFFER_SIZE:
-                            yield from buffer
-                            buffer.clear()
-                    line_count += 1
-
-                if buffer:
-                    yield from buffer
-            finally:
-                buffer.clear()
-                del buffer
+@contextmanager
+def batch_context():
+    """Context manager for batch processing to ensure cleanup"""
+    batch_data = {}
+    try:
+        yield batch_data
+    finally:
+        for key in list(batch_data.keys()):
+            del batch_data[key]
+        del batch_data
+        gc.collect()
 
 
 def setup(rank, world_size):
@@ -114,12 +165,61 @@ def process_labels(
 def reload_model(rank, model_path, device):
     """Reload model to combat memory fragmentation"""
     torch.cuda.empty_cache()
+    gc.collect()
     new_model = AutoModelForSequenceClassification.from_pretrained(model_path).to(
         device
     )
     new_model = DDP(new_model, device_ids=[rank], find_unused_parameters=False)
     torch.cuda.empty_cache()
     return new_model
+
+
+def process_mini_batch(batch_indices, encodings, text_data, model, device, rank):
+    """Process a single mini-batch"""
+    with batch_context() as mini_batch:
+        current_batch_size = len(batch_indices)
+        current_length = max(len(encodings["input_ids"][idx]) for idx in batch_indices)
+
+        input_ids = torch.zeros(
+            (current_batch_size, current_length),
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros(
+            (current_batch_size, current_length),
+            dtype=torch.long,
+            device=device,
+        )
+
+        for j, idx in enumerate(batch_indices):
+            seq = encodings["input_ids"][idx]
+            seq_len = len(seq)
+            input_ids[j, :seq_len] = torch.tensor(seq, dtype=torch.long, device=device)
+            attention_mask[j, :seq_len] = 1
+
+        with torch.inference_mode():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            probabilities = sigmoid(outputs.logits)
+            predicted_labels = (probabilities > 0.5).int()
+
+        batch_items = [text_data[idx][1] for idx in batch_indices]
+        batch_positions = [text_data[idx][0] for idx in batch_indices]
+
+        results = []
+        for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
+            zip(batch_items, probabilities, predicted_labels, batch_positions)
+        ):
+            processed_item = process_labels(
+                item_data.copy(),
+                prob,
+                pred_label,
+                labels_all,
+                child_to_parent,
+                label_to_index,
+            )
+            results.append((orig_pos, processed_item))
+
+        return results
 
 
 def batch_process(
@@ -140,110 +240,160 @@ def batch_process(
 
     while True:
         try:
-            # Periodic model reload to combat fragmentation
             if processed_count > 0 and processed_count % RELOAD_INTERVAL == 0:
                 print(f"GPU {rank}: Reloading model at {processed_count} items")
                 model = reload_model(rank, model_path, device)
 
-            torch.cuda.empty_cache()
-
-            large_batch = list(islice(data_iterator, max_batch_length))
-            if not large_batch:
-                break
-
-            positions, lines = zip(*large_batch)
-            text_data = [(idx, json.loads(line)) for idx, line in zip(positions, lines)]
-            texts = [item[1]["text"] for item in text_data]
-
-            encodings = tokenizer(
-                texts,
-                truncation=True,
-                max_length=max_length,
-                padding=False,
-                return_tensors=None,
-            )
-
-            lengths = [len(ids) for ids in encodings["input_ids"]]
-            sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
-
-            processed_results = []
-
-            for i in range(0, len(sorted_indices), batch_size):
+            with batch_context() as batch_data:
                 torch.cuda.empty_cache()
+                gc.collect()
 
-                current_batch_size = min(batch_size, len(sorted_indices) - i)
-                batch_indices = sorted_indices[i : i + current_batch_size]
+                large_batch = list(islice(data_iterator, max_batch_length))
+                if not large_batch:
+                    break
 
-                current_length = max(
-                    len(encodings["input_ids"][idx]) for idx in batch_indices
-                )
-                input_ids = torch.zeros(
-                    (current_batch_size, current_length),
-                    dtype=torch.long,
-                    device=device,
-                )
-                attention_mask = torch.zeros(
-                    (current_batch_size, current_length),
-                    dtype=torch.long,
-                    device=device,
+                positions, lines = zip(*large_batch)
+                text_data = [
+                    (idx, json.loads(line)) for idx, line in zip(positions, lines)
+                ]
+                texts = [item[1]["text"] for item in text_data]
+
+                encodings = tokenizer(
+                    texts,
+                    truncation=True,
+                    max_length=max_length,
+                    padding=False,
+                    return_tensors=None,
                 )
 
-                for j, idx in enumerate(batch_indices):
-                    seq = encodings["input_ids"][idx]
-                    seq_len = len(seq)
-                    input_ids[j, :seq_len] = torch.tensor(
-                        seq, dtype=torch.long, device=device
+                lengths = [len(ids) for ids in encodings["input_ids"]]
+                sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+
+                processed_results = []
+
+                # Process in mini-batches
+                for i in range(0, len(sorted_indices), batch_size):
+                    batch_indices = sorted_indices[i : i + batch_size]
+                    results = process_mini_batch(
+                        batch_indices, encodings, text_data, model, device, rank
                     )
-                    attention_mask[j, :seq_len] = 1
+                    processed_results.extend(results)
+                    processed_count += len(results)
+                    gc.collect()
 
-                with torch.inference_mode():
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    probabilities = sigmoid(outputs.logits)
-                    predicted_labels = (probabilities > 0.5).int()
-
-                batch_items = [text_data[idx][1] for idx in batch_indices]
-                batch_positions = [text_data[idx][0] for idx in batch_indices]
-
-                for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
-                    zip(batch_items, probabilities, predicted_labels, batch_positions)
-                ):
-                    processed_item = process_labels(
-                        item_data.copy(),
-                        prob,
-                        pred_label,
-                        labels_all,
-                        child_to_parent,
-                        label_to_index,
+                if rank == 0 and processed_count % 1000 == 0:
+                    mem_info = monitor_memory(rank)
+                    print(
+                        f"GPU {rank}: Processed {processed_count} items, "
+                        f"GPU Memory: {torch.cuda.memory_allocated(device)/1024**3:.2f}GB, "
+                        f"RAM: {mem_info['rss']:.2f}GB, "
+                        f"FDs: {mem_info['fds']}, "
+                        f"Threads: {mem_info['threads']}"
                     )
-                    processed_results.append((orig_pos, processed_item))
-                    processed_count += 1
 
-                del input_ids, attention_mask, outputs, probabilities, predicted_labels
-
-            if rank == 0 and processed_count % 1000 == 0:
-                mem_info = get_process_memory()
-                print(
-                    f"GPU {rank}: Processed {processed_count} items, "
-                    f"GPU Memory: {torch.cuda.memory_allocated(device)/1024**3:.2f}GB, "
-                    f"RAM: {mem_info['rss']:.2f}GB, "
-                    f"FDs: {mem_info['fds']}, "
-                    f"Threads: {mem_info['threads']}"
-                )
-
-            del texts, encodings, lengths, sorted_indices
-            processed_results.sort(key=lambda x: x[0])
-            yield processed_results
-            del processed_results
+                processed_results.sort(key=lambda x: x[0])
+                yield processed_results
 
         except Exception as e:
             print(f"Error in batch processing on GPU {rank}: {str(e)}")
             raise e
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
 
     print(f"GPU {rank}: Completed processing {processed_count} items")
 
 
-# [OrderedFileReader class remains unchanged]
-# [merge_ordered_files function remains unchanged]
+class OrderedFileReader:
+    """Helper class to read and track items from a file with their positions"""
+
+    def __init__(self, file_path):
+        self.file = open(file_path, "rb")
+        self.dctx = zstd.ZstdDecompressor()
+        self.reader = self.dctx.stream_reader(self.file)
+        self.text_reader = io.TextIOWrapper(self.reader, encoding="utf-8")
+        self.current_item = None
+        self.exhausted = False
+        self._finalizer = weakref.finalize(self, self.close)
+        self._read_next()
+
+    def _read_next(self):
+        try:
+            line = self.text_reader.readline()
+            if not line:
+                self.exhausted = True
+                self.current_item = None
+            else:
+                item = json.loads(line)
+                self.current_item = (item["original_position"], item["data"])
+        except Exception as e:
+            print(f"Error reading line: {e}")
+            self.exhausted = True
+            self.current_item = None
+
+    def get_current(self):
+        return self.current_item
+
+    def advance(self):
+        self._read_next()
+
+    def close(self):
+        self.text_reader.close()
+        self.reader.close()
+        self.file.close()
+
+
+def merge_ordered_files(temp_files, output_path, buffer_size=8 * 1024 * 1024):
+    """Merge multiple ordered files while maintaining global order"""
+    readers = [OrderedFileReader(f) for f in temp_files]
+    active_readers = len(readers)
+
+    with open(output_path, "wb", buffering=buffer_size) as final_out:
+        cctx = zstd.ZstdCompressor(level=1)
+        with cctx.stream_writer(final_out) as final_writer:
+            output_position = 0
+            string_buffer = []
+            string_buffer_size = 0
+
+            while active_readers > 0:
+                min_pos = float("inf")
+                min_reader_idx = -1
+
+                for idx, reader in enumerate(readers):
+                    if not reader.exhausted:
+                        current = reader.get_current()
+                        if current and current[0] < min_pos:
+                            min_pos = current[0]
+                            min_reader_idx = idx
+
+                if min_reader_idx == -1:
+                    break
+
+                assert (
+                    min_pos == output_position
+                ), f"Position mismatch: expected {output_position}, got {min_pos}"
+
+                pos, item = readers[min_reader_idx].get_current()
+                line = json.dumps(item) + "\n"
+                string_buffer.append(line)
+                string_buffer_size += len(line)
+
+                if string_buffer_size >= buffer_size:
+                    final_writer.write("".join(string_buffer).encode("utf-8"))
+                    string_buffer = []
+                    string_buffer_size = 0
+
+                readers[min_reader_idx].advance()
+                if readers[min_reader_idx].exhausted:
+                    active_readers -= 1
+
+                output_position += 1
+
+            if string_buffer:
+                final_writer.write("".join(string_buffer).encode("utf-8"))
+
+    for reader in readers:
+        reader.close()
 
 
 def process_and_save_ddp(rank, cfg, world_size):
@@ -270,12 +420,12 @@ def process_and_save_ddp(rank, cfg, world_size):
         tokenizer = AutoTokenizer.from_pretrained(config.get("_name_or_path"))
 
         temp_output_path = f"{cfg.output_path}.temp_{rank}"
-
         start_time = time.time()
+
         if rank == 0:
             print(f"Starting processing on {world_size} GPUs")
 
-        WRITE_BUFFER_SIZE = 8 * 1024 * 1024
+        WRITE_BUFFER_SIZE = 8 * 1
         string_buffer = []
         string_buffer_size = 0
         MAX_BUFFER_SIZE = 16 * 1024 * 1024
