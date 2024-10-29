@@ -14,7 +14,6 @@ from itertools import islice
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import gc
 
 # Enable TF32
 torch.set_float32_matmul_precision("high")
@@ -43,26 +42,21 @@ label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 def local_data_adaptive(file_path, rank, world_size):
     """Process data while preserving original line order"""
-    buffer = []
-    BUFFER_SIZE = 1000
+    CHUNK_SIZE = 1024 * 1024  # 1MB chunks
     line_count = 0
 
     with open(file_path, "rb") as file:
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(file) as reader:
-            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            while True:
+                line = text_stream.readline()
+                if not line:
+                    break
 
-            for line in text_reader:
                 if line_count % world_size == rank:
-                    # Store original position with the line
-                    buffer.append((line_count, line))
-                    if len(buffer) >= BUFFER_SIZE:
-                        yield from buffer
-                        buffer = []
+                    yield (line_count, line)
                 line_count += 1
-
-            if buffer:
-                yield from buffer
 
 
 def setup(rank, world_size):
@@ -118,18 +112,33 @@ def batch_process(
     processed_count = 0
 
     while True:
-        # Clear CUDA cache at the start of each large batch
-        torch.cuda.empty_cache()
+        # Process data in smaller chunks to avoid memory accumulation
+        current_batch = []
+        for _ in range(max_batch_length):
+            try:
+                item = next(data_iterator)
+                current_batch.append(item)
+            except StopIteration:
+                if not current_batch:
+                    return
+                break
 
-        large_batch = list(islice(data_iterator, max_batch_length))
-        if not large_batch:
-            break
+        # Process positions and lines immediately
+        positions = []
+        text_data = []
+        for pos, line in current_batch:
+            positions.append(pos)
+            # Parse JSON immediately and only keep what we need
+            parsed = json.loads(line)
+            text_data.append(
+                (pos, {"text": parsed["text"]})
+            )  # Only keep necessary fields
 
-        # Unpack the position and line data
-        positions, lines = zip(*large_batch)
-        text_data = [(idx, json.loads(line)) for idx, line in zip(positions, lines)]
+        current_batch = None  # Clear the raw data immediately
+
         texts = [item[1]["text"] for item in text_data]
 
+        # Get encodings for current batch
         encodings = tokenizer(
             texts,
             truncation=True,
@@ -138,33 +147,36 @@ def batch_process(
             return_tensors=None,
         )
 
-        # Clear some memory
-        texts = None
+        texts = None  # Clear texts after encoding
 
         lengths = [len(ids) for ids in encodings["input_ids"]]
         sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+        lengths = None  # Clear lengths array
 
         processed_results = []
 
+        # Process in smaller batches
         for i in range(0, len(sorted_indices), batch_size):
             current_batch_size = min(batch_size, len(sorted_indices) - i)
             batch_indices = sorted_indices[i : i + current_batch_size]
 
+            # Create minimal batch items
             batch_items = [text_data[idx][1] for idx in batch_indices]
             batch_positions = [text_data[idx][0] for idx in batch_indices]
+
+            # Only keep necessary encoding data for current batch
             batch_encodings = {
                 key: [encodings[key][idx] for idx in batch_indices]
                 for key in encodings.keys()
             }
 
-            # Get the maximum length in this batch
             current_length = max(len(seq) for seq in batch_encodings["input_ids"])
 
-            # Reset buffers to zero
+            # Reset buffers
             input_ids_buffer.zero_()
             attention_mask_buffer.zero_()
 
-            # Fill the pre-allocated buffers
+            # Fill buffers
             for j, seq in enumerate(batch_encodings["input_ids"]):
                 seq_len = len(seq)
                 input_ids_buffer[j, :seq_len].copy_(
@@ -172,7 +184,6 @@ def batch_process(
                 )
                 attention_mask_buffer[j, :seq_len] = 1
 
-            # Use views of the buffers for the current batch
             input_ids = input_ids_buffer[:current_batch_size, :current_length]
             attention_mask = attention_mask_buffer[:current_batch_size, :current_length]
 
@@ -181,16 +192,14 @@ def batch_process(
                 probabilities = sigmoid(outputs.logits)
                 predicted_labels = (probabilities > 0.5).int()
 
-                # Clear memory of intermediate tensors
-                del outputs
-
+                # Process each item individually to avoid accumulating large lists
                 for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
                     zip(batch_items, probabilities, predicted_labels, batch_positions)
                 ):
                     processed_item = process_labels(
                         item_data.copy(),
-                        prob.cpu(),  # Move to CPU before processing
-                        pred_label.cpu(),  # Move to CPU before processing
+                        prob.cpu(),
+                        pred_label.cpu(),
                         labels_all,
                         child_to_parent,
                         label_to_index,
@@ -198,33 +207,23 @@ def batch_process(
                     processed_results.append((orig_pos, processed_item))
                     processed_count += 1
 
-                # Clear GPU memory of batch tensors
-                del probabilities
-                del predicted_labels
-
-            # Clear batch-specific variables
-            del batch_encodings
-            del input_ids
-            del attention_mask
+            # Clear batch data explicitly
+            batch_items = None
+            batch_positions = None
+            batch_encodings = None
 
             if rank == 0 and processed_count % 1000 == 0:
                 print(f"GPU {rank}: Processed {processed_count} items")
-                # Force garbage collection after each batch
 
-                gc.collect()
-                torch.cuda.empty_cache()
-
-        # Sort by original position before yielding
+        # Sort and yield results
         processed_results.sort(key=lambda x: x[0])
         yield processed_results
 
-        # Clear large batch variables
-        del large_batch
-        del text_data
-        del encodings
-        del processed_results
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Clear all batch-related data
+        text_data = None
+        encodings = None
+        sorted_indices = None
+        processed_results = None
 
     print(f"GPU {rank}: Completed processing {processed_count} items")
 
