@@ -100,7 +100,7 @@ def batch_process(
     tokenizer,
     input_path,
     batch_size=128,
-    max_batch_length=12800,
+    max_batch_length=1000,
 ):
     data_iterator = local_data_adaptive(input_path, rank, world_size)
     device = torch.device(f"cuda:{rank}")
@@ -117,6 +117,7 @@ def batch_process(
     processed_count = 0
 
     while True:
+        # Get a larger batch to process efficiently
         large_batch = list(islice(data_iterator, max_batch_length))
         if not large_batch:
             break
@@ -126,9 +127,12 @@ def batch_process(
         text_data = [(idx, json.loads(line)) for idx, line in zip(positions, lines)]
         texts = [item[1]["text"] for item in text_data]
 
-        # Process texts in smaller chunks to prevent memory accumulation
-        chunk_size = 1000  # Adjust this value based on your RAM constraints
-        processed_encodings = {"input_ids": [], "attention_mask": []}
+        # Process in smaller chunks to manage memory
+        # Using a smaller chunk size than max_batch_length
+        chunk_size = min(
+            250, max_batch_length // 4
+        )  # Process in quarters or 250, whichever is smaller
+        encodings = {"input_ids": [], "attention_mask": []}
 
         for i in range(0, len(texts), chunk_size):
             chunk_texts = texts[i : i + chunk_size]
@@ -140,19 +144,19 @@ def batch_process(
                 return_tensors=None,
             )
 
-            processed_encodings["input_ids"].extend(chunk_encodings["input_ids"])
-            processed_encodings["attention_mask"].extend(
-                chunk_encodings["attention_mask"]
-            )
+            encodings["input_ids"].extend(chunk_encodings["input_ids"])
+            encodings["attention_mask"].extend(chunk_encodings["attention_mask"])
 
-            # Force garbage collection after each chunk
+            # Clean up chunk immediately
             del chunk_encodings
-            if i % (chunk_size * 5) == 0:  # Every 5 chunks
+            del chunk_texts
+
+            # Periodic garbage collection
+            if i % (chunk_size * 2) == 0:
                 import gc
 
                 gc.collect()
 
-        encodings = processed_encodings
         del texts  # Free up memory
 
         lengths = [len(ids) for ids in encodings["input_ids"]]
@@ -160,6 +164,7 @@ def batch_process(
 
         processed_results = []
 
+        # Process inference in batches
         for i in range(0, len(sorted_indices), batch_size):
             current_batch_size = min(batch_size, len(sorted_indices) - i)
             batch_indices = sorted_indices[i : i + current_batch_size]
@@ -171,7 +176,6 @@ def batch_process(
                 for key in encodings.keys()
             }
 
-            # Get the maximum length in this batch
             current_length = max(len(seq) for seq in batch_encodings["input_ids"])
 
             # Reset buffers to zero
@@ -209,15 +213,15 @@ def batch_process(
                 processed_results.append((orig_pos, processed_item))
                 processed_count += 1
 
-            if rank == 0 and processed_count % 1000 == 0:
+            if rank == 0 and processed_count % max_batch_length == 0:
                 print(f"GPU {rank}: Processed {processed_count} items")
 
-            # Clear batch-specific variables
+            # Clean up batch data
             del batch_encodings, outputs, probabilities, predicted_labels
 
-        # Clear large batch variables
+        # Clean up large batch data
         del encodings, lengths, sorted_indices, text_data
-        gc.collect()  # Force garbage collection after each large batch
+        gc.collect()
 
         # Sort by original position before yielding
         processed_results.sort(key=lambda x: x[0])
