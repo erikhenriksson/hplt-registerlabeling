@@ -198,7 +198,9 @@ def process_and_save_ddp(rank, cfg, world_size):
         if rank == 0:
             print(f"Processing chunk {chunk_idx + 1}...")
 
-        sorted_indices, encodings = tokenize_and_sort(chunk, chunk_start_idx)
+        sorted_indices, encodings = tokenize_and_sort(
+            chunk, chunk_start_idx, cfg.tokenizer
+        )
         batches = create_length_batches(
             chunk, sorted_indices, encodings, cfg.batch_size
         )
