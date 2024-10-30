@@ -69,7 +69,7 @@ def tokenize_and_sort(
 
     # Clear text_lengths to free memory
     text_lengths = None
-    gc.collect()
+    # gc.collect()
 
     return sorted_indices, encodings
 
@@ -157,7 +157,7 @@ def process_batch(
         )
     # Delete probs and registers
     del probs, registers
-    gc.collect()
+    # gc.collect()
     return results, inference_time
 
 
@@ -236,7 +236,7 @@ def process_and_save_ddp(rank, cfg, world_size):
             chunk_results.extend(results)
 
             results = None
-            gc.collect()
+            # gc.collect()
 
         # Gather results from all ranks for this chunk
         gathered_results = [None] * world_size if rank == 0 else None
@@ -281,7 +281,7 @@ def process_and_save_ddp(rank, cfg, world_size):
         rank_batches = None
         chunk_results = None
 
-        gc.collect()
+        # gc.collect()
 
     # Print final statistics (rank 0 only)
     if rank == 0:
