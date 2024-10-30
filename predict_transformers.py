@@ -112,7 +112,7 @@ def process_batch(
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
     # Convert to probabilities
-    probs = torch.sigmoid(outputs.logits).cpu().numpy()
+    probs = torch.sigmoid(outputs.logits.float()).cpu().numpy()
     registers = (probs > 0.5).astype(bool)
 
     # Format results
