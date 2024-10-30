@@ -186,23 +186,26 @@ def process_and_save_ddp(rank, cfg, world_size):
     total_batches = 0
     total_examples = 0
 
-    chunk_results = defaultdict(list)
-    first_chunk = True
+    # Initialize output file (rank 0 only)
+    if rank == 0:
+        with open(cfg.output_path, "w") as f:
+            f.write("id,registers,probabilities\n")
 
+    # Process data in chunks
     for chunk_idx, (chunk_start_idx, chunk) in enumerate(
         read_zst_chunks(cfg.input_path, chunk_size=cfg.chunk_size)
     ):
         if rank == 0:
             print(f"Processing chunk {chunk_idx + 1}...")
 
-        sorted_indices, encodings = tokenize_and_sort(
-            chunk, chunk_start_idx, cfg.tokenizer
-        )
+        sorted_indices, encodings = tokenize_and_sort(chunk, chunk_start_idx)
         batches = create_length_batches(
             chunk, sorted_indices, encodings, cfg.batch_size
         )
         rank_batches = batches[rank::world_size]
 
+        # Process each batch and save results immediately
+        chunk_results = []
         for batch_idx, (batch_texts, batch_encodings) in enumerate(rank_batches):
             results, inference_time = process_batch(
                 batch_texts, batch_encodings, model, rank
@@ -212,23 +215,45 @@ def process_and_save_ddp(rank, cfg, world_size):
             total_batches += 1
             total_examples += len(batch_texts)
 
-            chunk_results[rank].extend(results)
+            chunk_results.extend(results)
 
+        # Gather results from all ranks for this chunk
         gathered_results = [None] * world_size if rank == 0 else None
-        dist.gather_object(chunk_results[rank], gathered_results, dst=0)
+        dist.gather_object(chunk_results, gathered_results, dst=0)
 
+        # Save results from this chunk (rank 0 only)
         if rank == 0:
-            all_results = []
+            all_chunk_results = []
             for result_list in gathered_results:
                 if result_list:
-                    all_results.extend(result_list)
+                    all_chunk_results.extend(result_list)
 
-            save_results(all_results, cfg.output_path, mode="w" if first_chunk else "a")
-            first_chunk = False
+            # Sort by original index within this chunk
+            all_chunk_results.sort(key=lambda x: x["original_idx"])
 
-        chunk_results[rank] = []
+            # Save to file immediately
+            with open(cfg.output_path, "a") as f:
+                for result in all_chunk_results:
+                    # Format the line manually to avoid DataFrame overhead
+                    f.write(
+                        f"{result['id']},{result['registers']},{result['probabilities']}\n"
+                    )
+
+            # Clear results immediately
+            all_chunk_results = None
+
+        # Clear memory
+        chunk_results = None
         dist.barrier()
 
+        # Print progress (rank 0 only)
+        if rank == 0 and chunk_idx % 10 == 0:
+            print(
+                f"Processed {total_examples} examples. "
+                f"Current throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
+            )
+
+    # Print final statistics (rank 0 only)
     if rank == 0:
         print("\nFinal Timing Statistics:")
         print(f"Total Inference Time: {total_inference_time/1000:.2f} seconds")
@@ -246,7 +271,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("--base_model", default="xlm-roberta-base")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--chunk_size", type=int, default=10000)
+    parser.add_argument("--chunk_size", type=int, default=5000)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/input.jsonl.zst")
     parser.add_argument("--output_path", default="output.csv")
