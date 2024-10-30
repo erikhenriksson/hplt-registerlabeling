@@ -14,6 +14,7 @@ from torch.cuda.amp import autocast
 import io
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import gc
 
 
 def read_zst_chunks(file_path: str, chunk_size: int = 1000) -> Iterator[List[Dict]]:
@@ -35,29 +36,56 @@ def read_zst_chunks(file_path: str, chunk_size: int = 1000) -> Iterator[List[Dic
         yield chunk_start_idx, chunk
 
 
-def parallel_tokenize(texts: List[Dict], tokenizer) -> List[Dict]:
-    """Parallelize tokenization to reduce CPU bottleneck."""
-    with ThreadPoolExecutor() as executor:
-        encoded_texts = list(
-            executor.map(
-                lambda item: tokenizer(item["text"], truncation=True, max_length=512),
-                texts,
-            )
+def parallel_tokenize(
+    texts: List[Dict], tokenizer, batch_size: int = 1000
+) -> List[Dict]:
+    """Tokenize texts in smaller batches to reduce memory usage and clear intermediate results."""
+    all_encodings = []
+    for i in range(0, len(texts), batch_size):
+        batch_texts = [item["text"] for item in texts[i : i + batch_size]]
+
+        # Tokenize batch-wise
+        encodings = tokenizer(
+            batch_texts,
+            truncation=True,
+            max_length=512,
+            padding=False,
+            return_tensors="pt",  # Keeps it as PyTorch tensors for efficiency
         )
-    return encoded_texts
+
+        # Convert tokenized results to list of dicts to append
+        batch_encodings = [
+            {
+                "input_ids": encodings["input_ids"][j],
+                "attention_mask": encodings["attention_mask"][j],
+            }
+            for j in range(len(batch_texts))
+        ]
+        all_encodings.extend(batch_encodings)
+
+        # Clear intermediate data after each batch to reduce memory footprint
+        del batch_texts, batch_encodings, encodings
+        gc.collect()
+
+    return all_encodings
 
 
 def tokenize_and_sort(
     texts: List[Dict], chunk_start_idx: int, tokenizer
 ) -> Tuple[List[int], dict]:
-    """Tokenize texts with optimized sorting and add original index for tracking."""
-    # Tokenize texts in parallel
+    """Tokenize texts in batches to control memory usage and add sorting for efficient processing."""
+    # Tokenize in batches to avoid memory spikes
     encodings = parallel_tokenize(texts, tokenizer)
+
+    # Calculate lengths and sorting indices
     text_lengths = [(i, len(tokens["input_ids"])) for i, tokens in enumerate(encodings)]
     text_lengths.sort(key=lambda x: x[1])
     sorted_indices = [i for i, _ in text_lengths]
+
+    # Add original index for tracking
     for i, idx in enumerate(sorted_indices):
         texts[idx]["original_idx"] = chunk_start_idx + idx
+
     return sorted_indices, {
         "input_ids": [e["input_ids"] for e in encodings],
         "attention_mask": [e["attention_mask"] for e in encodings],
@@ -226,9 +254,10 @@ def process_and_save_ddp(rank, cfg, world_size):
         dist.barrier()
 
         if rank == 0 and chunk_idx % 10 == 0:
+            batch_throughput = 1000 * len(batch_texts) / inference_time
             print(
                 f"Processed {total_examples} examples. "
-                f"Current throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
+                f"Batch {batch_idx + 1} throughput: {batch_throughput:.2f} examples/sec"
             )
 
     if rank == 0:
