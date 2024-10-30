@@ -185,9 +185,6 @@ def process_and_save_ddp(rank, cfg, world_size):
     total_inference_time = 0
     total_batches = 0
     total_examples = 0
-    start_wall_time = torch.cuda.Event(enable_timing=True)
-    end_wall_time = torch.cuda.Event(enable_timing=True)
-    start_wall_time.record()
 
     # Initialize output file (rank 0 only)
     if rank == 0:
@@ -253,49 +250,20 @@ def process_and_save_ddp(rank, cfg, world_size):
 
         # Print progress (rank 0 only)
         if rank == 0 and chunk_idx % 10 == 0:
-            end_wall_time.record()
-            torch.cuda.synchronize()
-            wall_time_elapsed = (
-                start_wall_time.elapsed_time(end_wall_time) / 1000.0
-            )  # convert to seconds
-
-            # Gather total examples from all processes
-            all_examples = [None] * world_size
-            dist.all_gather_object(all_examples, total_examples)
-            global_total_examples = sum(all_examples)
-
             print(
-                f"Processed {global_total_examples} examples. "
-                f"Processing throughput: {global_total_examples / wall_time_elapsed:.2f} examples/sec "
-                f"(GPU throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec/gpu)"
+                f"Processed {total_examples} examples. "
+                f"Current throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
             )
 
     # Print final statistics (rank 0 only)
     if rank == 0:
-        end_wall_time.record()
-        torch.cuda.synchronize()
-        wall_time_elapsed = (
-            start_wall_time.elapsed_time(end_wall_time) / 1000.0
-        )  # convert to seconds
-
-        # Gather final totals from all processes
-        all_examples = [None] * world_size
-        all_inference_times = [None] * world_size
-        dist.all_gather_object(all_examples, total_examples)
-        dist.all_gather_object(all_inference_times, total_inference_time)
-
-        global_total_examples = sum(all_examples)
-        avg_inference_time = sum(all_inference_times) / world_size
-
         print("\nFinal Timing Statistics:")
-        print(f"Wall Clock Time: {wall_time_elapsed:.2f} seconds")
-        print(f"Average GPU Inference Time: {avg_inference_time/1000:.2f} seconds")
-        print(f"Total Examples Processed: {global_total_examples}")
+        print(f"Total Inference Time: {total_inference_time/1000:.2f} seconds")
+        print(f"Average Time per Batch: {total_inference_time/total_batches:.2f}ms")
+        print(f"Average Time per Example: {total_inference_time/total_examples:.2f}ms")
+        print(f"Total Examples Processed: {total_examples}")
         print(
-            f"Overall System Throughput: {global_total_examples / wall_time_elapsed:.2f} examples/sec"
-        )
-        print(
-            f"Per-GPU Throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec/gpu"
+            f"Overall Throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
         )
 
     cleanup()
