@@ -258,12 +258,12 @@ def process_and_save_ddp(rank, cfg, world_size):
                 f"Current throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
             )
         # Clear variables
-        # chunk = None
-        # sorted_indices = None
-        # encodings = None
-        # batches = None
-        # rank_batches = None
-        # chunk_results = None
+        chunk = None
+        sorted_indices = None
+        encodings = None
+        batches = None
+        rank_batches = None
+        chunk_results = None
 
         gc.collect()
 
