@@ -199,7 +199,7 @@ def process_and_save_ddp(rank, cfg, world_size):
         batches = create_length_batches(
             chunk, sorted_indices, encodings, cfg.batch_size
         )
-        rank_batches = batches[rank::world_size]
+        rank_batches = batches[rank::world_size]  # Distribute batches across GPUs
 
         # Process batches assigned to this rank
         for batch_idx, (batch_texts, batch_encodings) in enumerate(rank_batches):
@@ -214,42 +214,67 @@ def process_and_save_ddp(rank, cfg, world_size):
 
             chunk_results[rank].extend(results)
 
-            # Print timing statistics periodically from GPU 0
-            if rank == 0 and batch_idx % 10 == 0:
-                avg_time_per_batch = total_inference_time / total_batches
-                avg_time_per_example = total_inference_time / total_examples
-                print(
-                    f"GPU 0 Stats - "
-                    f"Avg time per batch: {avg_time_per_batch:.2f}ms, "
-                    f"Avg time per example: {avg_time_per_example:.2f}ms, "
-                    f"Total examples: {total_examples}, "
-                    f"Throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
-                )
+        # Gather timing stats from all ranks
+        all_times = [0] * world_size
+        all_examples = [0] * world_size
+        dist.all_gather_object(all_times, total_inference_time)
+        dist.all_gather_object(all_examples, total_examples)
 
-        # Rest of the processing (gathering results and saving) remains the same...
+        # Gather results from all ranks
         gathered_results = [None] * world_size if rank == 0 else None
         dist.gather_object(chunk_results[rank], gathered_results, dst=0)
 
         if rank == 0:
+            # Combine results from all ranks
             all_results = []
             for result_list in gathered_results:
-                all_results.extend(result_list)
+                if result_list:  # Check if the result list is not None
+                    all_results.extend(result_list)
+
+            # Save combined results
             save_results(all_results, cfg.output_path, mode="w" if first_chunk else "a")
+
+            # Print progress including stats from all GPUs
+            total_processed = sum(all_examples)
+            max_time = max(all_times)  # Use the slowest GPU's time
+            if chunk_idx % 5 == 0:
+                print(f"\nProgress Report:")
+                print(f"Total examples processed: {total_processed}")
+                print(
+                    f"Average throughput: {1000 * total_processed / max_time:.2f} examples/sec"
+                )
+                print(f"Time elapsed: {max_time/1000:.2f} seconds")
+
             first_chunk = False
 
+        # Clear results for this chunk
         chunk_results[rank] = []
+
+        # Synchronize before next chunk
         dist.barrier()
 
-    # Print final timing statistics from GPU 0
+    # Gather final timing statistics from all ranks
+    all_times = [0] * world_size
+    all_examples = [0] * world_size
+    dist.all_gather_object(all_times, total_inference_time)
+    dist.all_gather_object(all_examples, total_examples)
+
     if rank == 0:
+        total_processed = sum(all_examples)
+        max_time = max(all_times)  # Use the slowest GPU's time
+
         print("\nFinal Timing Statistics:")
-        print(f"Total Inference Time: {total_inference_time/1000:.2f} seconds")
-        print(f"Average Time per Batch: {total_inference_time/total_batches:.2f}ms")
-        print(f"Average Time per Example: {total_inference_time/total_examples:.2f}ms")
-        print(f"Total Examples Processed: {total_examples}")
+        print(f"Total Inference Time: {max_time/1000:.2f} seconds")
+        print(f"Total Examples Processed: {total_processed}")
         print(
-            f"Overall Throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
+            f"Overall Throughput: {1000 * total_processed / max_time:.2f} examples/sec"
         )
+        print(f"Per-GPU statistics:")
+        for gpu_id in range(world_size):
+            print(
+                f"GPU {gpu_id}: {all_examples[gpu_id]} examples in {all_times[gpu_id]/1000:.2f} seconds "
+                f"({1000 * all_examples[gpu_id] / all_times[gpu_id]:.2f} examples/sec)"
+            )
 
     cleanup()
 
