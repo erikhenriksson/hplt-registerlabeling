@@ -37,11 +37,12 @@ def read_zst_chunks(file_path: str, chunk_size: int = 1000) -> Iterator[List[Dic
 
 
 def parallel_tokenize(
-    texts: List[Dict], tokenizer, batch_size: int = 1000
+    texts: List[Dict], tokenizer, batch_size: int = 1000, reset_interval: int = 10
 ) -> List[Dict]:
-    """Tokenize texts in smaller batches to reduce memory usage and clear intermediate results."""
+    """Tokenize texts in smaller batches with periodic tokenizer reset to reduce memory usage."""
     all_encodings = {"input_ids": [], "attention_mask": []}
-    for i in range(0, len(texts), batch_size):
+
+    for batch_num, i in enumerate(range(0, len(texts), batch_size)):
         batch_texts = [item["text"] for item in texts[i : i + batch_size]]
 
         # Tokenize batch-wise with padding and truncation enabled
@@ -49,25 +50,28 @@ def parallel_tokenize(
             batch_texts,
             truncation=True,
             max_length=512,
-            padding=True,  # Ensure uniform tensor shape within each batch
-            return_tensors="pt",  # Return as PyTorch tensors for efficiency
+            padding=True,
+            return_tensors="pt",
         )
 
         # Append tensors from each batch to the overall encoding lists
-        all_encodings["input_ids"].append(encodings["input_ids"].cpu())  # Move to CPU
-        all_encodings["attention_mask"].append(
-            encodings["attention_mask"].cpu()
-        )  # Move to CPU
+        all_encodings["input_ids"].append(encodings["input_ids"].cpu())
+        all_encodings["attention_mask"].append(encodings["attention_mask"].cpu())
 
-        # Clear intermediate data and force garbage collection to reduce memory footprint
+        # Clear intermediate data and force garbage collection
         del batch_texts, encodings
-        tokenizer.backend_tokenizer.clear()  # Clear the tokenizer's cache
+        # tokenizer.backend_tokenizer.clear()
         gc.collect()
-        torch.cuda.empty_cache()  # Clear GPU memory if anything remains on GPU
+        torch.cuda.empty_cache()
+
+        # Reinitialize tokenizer after `reset_interval` batches
+        if (batch_num + 1) % reset_interval == 0:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer.name_or_path)
 
     # Concatenate all batches into single tensors
     all_encodings["input_ids"] = torch.cat(all_encodings["input_ids"], dim=0)
     all_encodings["attention_mask"] = torch.cat(all_encodings["attention_mask"], dim=0)
+
     return all_encodings
 
 
