@@ -14,6 +14,9 @@ from torch.cuda.amp import autocast
 import io
 from collections import defaultdict
 
+# Invoke garbage collector
+import gc
+
 
 def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Dict]]:
     """Stream data from zst file in chunks."""
@@ -255,15 +258,12 @@ def process_and_save_ddp(rank, cfg, world_size):
                 f"Current throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
             )
         # Clear variables
-        chunk = None
-        sorted_indices = None
-        encodings = None
-        batches = None
-        rank_batches = None
-        chunk_results = None
-
-        # Invoke garbage collector
-        import gc
+        # chunk = None
+        # sorted_indices = None
+        # encodings = None
+        # batches = None
+        # rank_batches = None
+        # chunk_results = None
 
         gc.collect()
 
