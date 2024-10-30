@@ -332,3 +332,7 @@ def main():
     # Launch DDP processes
     print("Starting distributed processing...")
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
+
+
+if __name__ == "__main__":
+    main()
