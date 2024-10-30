@@ -6,7 +6,6 @@ import time
 import zstandard as zstd
 import io
 import torch
-from tqdm.auto import tqdm
 from argparse import ArgumentParser
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from torch.nn.functional import sigmoid
