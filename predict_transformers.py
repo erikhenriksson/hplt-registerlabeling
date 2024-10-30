@@ -195,8 +195,6 @@ def process_and_save_ddp(rank, cfg, world_size):
     for chunk_idx, (chunk_start_idx, chunk) in enumerate(
         read_zst_chunks(cfg.input_path, chunk_size=cfg.chunk_size)
     ):
-        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
-        cfg.tokenizer = tokenizer
         if rank == 0:
             print(f"Processing chunk {chunk_idx + 1}...")
 
@@ -256,6 +254,18 @@ def process_and_save_ddp(rank, cfg, world_size):
                 f"Processed {total_examples} examples. "
                 f"Current throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
             )
+        # Clear variables
+        chunk = None
+        sorted_indices = None
+        encodings = None
+        batches = None
+        rank_batches = None
+        chunk_results = None
+
+        # Invoke garbage collector
+        import gc
+
+        gc.collect()
 
     # Print final statistics (rank 0 only)
     if rank == 0:
