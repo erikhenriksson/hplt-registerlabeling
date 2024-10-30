@@ -107,8 +107,8 @@ def process_batch(
     attention_mask = attention_mask.to(device)
 
     # Get predictions
-    with torch.no_grad(), autocast(dtype=torch.bfloat16):
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    # with torch.no_grad(), autocast(dtype=torch.bfloat16):
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
     # Convert to probabilities
     probs = torch.sigmoid(outputs.logits).cpu().numpy()
@@ -158,7 +158,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     # Load model
     model = AutoModelForSequenceClassification.from_pretrained(
         cfg.model_path,
-        num_labels=25,  # Assuming 25 registers
+        # num_labels=25,  # Assuming 25 registers
         torch_dtype=torch.bfloat16,
     ).to(rank)
 
