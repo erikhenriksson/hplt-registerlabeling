@@ -55,16 +55,16 @@ def tokenize_and_sort(texts: List[Dict], tokenizer) -> Tuple[List[int], dict]:
 def create_length_batches(
     texts: List[Dict], sorted_indices: List[int], encodings: dict, batch_size: int
 ) -> List[Tuple[List[Dict], dict, List[int]]]:
-    """Create batches of similar length texts with their encodings and original positions."""
+    """Create batches of similar length texts with their encodings and original indices."""
     batches = []
     current_batch_indices = []
     current_batch_texts = []
-    current_batch_positions = []  # Track original positions
+    current_orig_indices = []  # Track original positions
 
     for batch_idx, idx in enumerate(sorted_indices):
         current_batch_indices.append(idx)
         current_batch_texts.append(texts[idx])
-        current_batch_positions.append(batch_idx)  # Store original position
+        current_orig_indices.append(batch_idx)  # Store original position
 
         if len(current_batch_indices) >= batch_size:
             # Create batch encodings
@@ -74,12 +74,10 @@ def create_length_batches(
                     encodings["attention_mask"][i] for i in current_batch_indices
                 ],
             }
-            batches.append(
-                (current_batch_texts, batch_encodings, current_batch_positions)
-            )
+            batches.append((current_batch_texts, batch_encodings, current_orig_indices))
             current_batch_indices = []
             current_batch_texts = []
-            current_batch_positions = []
+            current_orig_indices = []
 
     if current_batch_texts:  # Don't forget the last batch
         batch_encodings = {
@@ -88,7 +86,7 @@ def create_length_batches(
                 encodings["attention_mask"][i] for i in current_batch_indices
             ],
         }
-        batches.append((current_batch_texts, batch_encodings, current_batch_positions))
+        batches.append((current_batch_texts, batch_encodings, current_orig_indices))
 
     return batches
 
@@ -96,11 +94,11 @@ def create_length_batches(
 def process_batch(
     batch_texts: List[Dict],
     batch_encodings: dict,
-    original_positions: List[int],
+    original_indices: List[int],
     model,
     device,
-) -> List[Tuple[Dict, int]]:
-    """Process a single batch and return results with original positions."""
+) -> Tuple[List[Tuple[Dict, int]], float]:
+    """Process a single batch and return results with original indices and timing."""
     # Pad and convert to tensors
     input_ids = torch.nn.utils.rnn.pad_sequence(
         [torch.tensor(x) for x in batch_encodings["input_ids"]], batch_first=True
@@ -122,31 +120,33 @@ def process_batch(
 
     start_time.record()
 
+    # Get predictions
     with torch.no_grad(), autocast(dtype=torch.bfloat16):
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         probs = torch.sigmoid(outputs.logits)
-
-    probs = probs.float()
 
     end_time.record()
     torch.cuda.synchronize()
     inference_time = start_time.elapsed_time(end_time)
 
-    probs = probs.cpu().numpy()
+    probs = probs.float().cpu().numpy()
     registers = (probs > 0.5).astype(bool)
 
-    # Format results with original positions
+    # Format results with original indices
     results = []
-    for item, prob_row, reg_row, orig_pos in zip(
-        batch_texts, probs, registers, original_positions
+    for item, prob_row, reg_row, orig_idx in zip(
+        batch_texts, probs, registers, original_indices
     ):
-        result = {
-            "id": item["id"],
-            "registers": np.where(reg_row)[0].tolist(),
-            "probabilities": [f"{p:.4f}" for p in prob_row],
-            "original_position": orig_pos,  # Include original position in result
-        }
-        results.append((result, orig_pos))  # Return as tuple with position
+        results.append(
+            (
+                {
+                    "id": item["id"],
+                    "registers": np.where(reg_row)[0].tolist(),
+                    "probabilities": [f"{p:.4f}" for p in prob_row],
+                },
+                orig_idx,
+            )
+        )
 
     return results, inference_time
 
@@ -170,6 +170,7 @@ def cleanup():
 
 
 def process_and_save_ddp(rank, cfg, world_size):
+    """Main processing function for each GPU."""
     setup(rank, world_size)
     torch.cuda.set_device(rank)
 
@@ -191,10 +192,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     total_examples = 0
 
     # Process data in chunks
-    chunk_results = defaultdict(list)
     first_chunk = True
-
-    chunk_position_offset = 0  # Track position across chunks
 
     for chunk_idx, chunk in enumerate(
         read_zst_chunks(cfg.input_path, chunk_size=cfg.chunk_size)
@@ -210,56 +208,47 @@ def process_and_save_ddp(rank, cfg, world_size):
         rank_batches = batches[rank::world_size]
 
         # Process batches assigned to this rank
-        for batch_idx, (batch_texts, batch_encodings, batch_positions) in enumerate(
+        chunk_results = []
+        for batch_idx, (batch_texts, batch_encodings, orig_indices) in enumerate(
             rank_batches
         ):
-            # Adjust positions with chunk offset
-            adjusted_positions = [
-                pos + chunk_position_offset for pos in batch_positions
-            ]
             results, inference_time = process_batch(
-                batch_texts, batch_encodings, adjusted_positions, model, rank
+                batch_texts, batch_encodings, orig_indices, model, rank
             )
+            chunk_results.extend(results)
 
+            # Update timing stats
             total_inference_time += inference_time
             total_batches += 1
             total_examples += len(batch_texts)
 
-            chunk_results[rank].extend(results)
+            if rank == 0 and batch_idx % 10 == 0:
+                print(f"GPU {rank}: Processed {total_examples} examples")
 
         # Gather results from all ranks
         gathered_results = [None] * world_size if rank == 0 else None
-        dist.gather_object(chunk_results[rank], gathered_results, dst=0)
+        dist.gather_object(chunk_results, gathered_results, dst=0)
 
         # Save results (rank 0 only)
         if rank == 0:
-            # Combine results from all GPUs
+            # Combine all results
             all_results = []
             for result_list in gathered_results:
                 if result_list:
                     all_results.extend(result_list)
 
-            # Sort by original position before saving
-            all_results.sort(key=lambda x: x[1])  # Sort by the position
+            # Sort by original index
+            all_results.sort(key=lambda x: x[1])
 
-            # Extract just the results (without positions) for saving
+            # Extract just the results (without indices) for saving
             sorted_results = [result for result, _ in all_results]
 
-            # Remove the temporary position tracking field
-            for result in sorted_results:
-                del result["original_position"]
-
-            # Save in correct order
+            # Save
             save_results(
                 sorted_results, cfg.output_path, mode="w" if first_chunk else "a"
             )
             first_chunk = False
 
-        # Update position offset for next chunk
-        chunk_position_offset += len(chunk)
-
-        # Clear results for this chunk
-        chunk_results[rank] = []
         dist.barrier()
 
     # Gather final timing statistics from all ranks
@@ -330,17 +319,15 @@ def main():
     print(f"Running with {world_size} GPUs")
 
     # Adjust batch size based on number of GPUs
-    # For single GPU, keep original batch size
-    # For multiple GPUs, use larger batches to reduce DDP overhead
     if world_size > 1:
-        cfg.batch_size = (
-            cfg.batch_size * world_size
-        )  # Increase batch size significantly for multi-GPU
+        cfg.batch_size = cfg.batch_size * 4  # Increase batch size for multi-GPU
         print(f"Adjusted batch size to {cfg.batch_size} for multi-GPU processing")
 
     # Launch DDP processes
     print("Starting distributed processing...")
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
+
+    print("Processing complete!")
 
 
 if __name__ == "__main__":
