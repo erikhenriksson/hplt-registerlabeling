@@ -8,7 +8,7 @@
 
 if [[ -z "$SLURM_JOB_ID" ]]; then
   PARTITION="gpumedium"
-  TIME="36:00:00"
+  TIME="12:00:00"
   NUM_GPUS=4
   MEM=8
   if [[ $1 == "1h" ]]; then
