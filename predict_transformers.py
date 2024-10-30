@@ -173,7 +173,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     torch.cuda.set_device(rank)
 
     # Load tokenizer within each process
-    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, use_fast=False))
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, use_fast=False)
     cfg.tokenizer = tokenizer
 
     torch.backends.cuda.matmul.allow_tf32 = True
