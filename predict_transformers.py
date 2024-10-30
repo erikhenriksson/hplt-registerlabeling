@@ -16,22 +16,31 @@ from collections import defaultdict
 
 
 def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Dict]]:
-    """Stream data from zst file in chunks."""
-    chunk = []
-    chunk_start_idx = 0  # Track starting index of each chunk
+    # Reduce memory usage during decompression
     with open(file_path, "rb") as fh:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(fh) as reader:
-            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-            for line_idx, line in enumerate(text_stream):
-                if len(chunk) >= chunk_size:
-                    yield chunk_start_idx, chunk
-                    chunk = []
-                    chunk_start_idx = line_idx
+        dctx = zstd.ZstdDecompressor(
+            max_window_size=2**27
+        )  # Limit decompression memory
+        stream = dctx.stream_reader(fh)
+        text_stream = io.TextIOWrapper(stream, encoding="utf-8")
+        chunk = []
+        chunk_start_idx = 0
+
+        for line_idx, line in enumerate(text_stream):
+            if len(chunk) >= chunk_size:
+                yield chunk_start_idx, chunk
+                del chunk  # Explicit cleanup
+                chunk = []
+                chunk_start_idx = line_idx
+
+            try:
                 item = json.loads(line)
                 chunk.append(item)
-    if chunk:  # Don't forget the last chunk
-        yield chunk_start_idx, chunk
+            except json.JSONDecodeError:
+                continue
+
+        if chunk:
+            yield chunk_start_idx, chunk
 
 
 def tokenize_and_sort(
