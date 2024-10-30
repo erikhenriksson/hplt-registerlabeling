@@ -158,6 +158,9 @@ def process_batch(
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         probs = torch.sigmoid(outputs.logits)
 
+    del input_ids, attention_mask, outputs
+    torch.cuda.empty_cache()
+
     probs = probs.float()
 
     end_time.record()
