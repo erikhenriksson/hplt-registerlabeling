@@ -13,6 +13,7 @@ from typing import List, Dict, Any
 import numpy as np
 from itertools import islice
 from torch.cuda.amp import autocast
+import io
 
 
 class StreamingJSONLDataset(Dataset):
