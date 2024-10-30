@@ -280,10 +280,10 @@ def process_and_save_ddp(rank, cfg, world_size):
         # Clean up temp files and preprocessed data
         for temp_file in temp_files:
             os.remove(temp_file)
-        for preprocess_file in [
+        for preprocess_filee in [
             f"{cfg.preprocess_dir}/preprocessed_{r}.pt" for r in range(world_size)
         ]:
-            os.remove(preprocess_file)
+            os.remove(preprocess_filee)
 
     cleanup()
 
