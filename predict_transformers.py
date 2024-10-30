@@ -42,6 +42,16 @@ child_to_parent = {
 label_to_index = {label: idx for idx, label in enumerate(labels_all)}
 
 
+def setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
 class PreprocessedDataset(Dataset):
     def __init__(self, encodings, original_items, positions):
         self.encodings = encodings
@@ -60,12 +70,9 @@ class PreprocessedDataset(Dataset):
         return len(self.positions)
 
 
-def preprocess_file(input_path, output_dir, rank, world_size):
+def preprocess_file(input_path, output_dir, rank, world_size, tokenizer):
     """Preprocess the zst file and save tokenized data for each GPU"""
     os.makedirs(output_dir, exist_ok=True)
-
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
 
     texts = []
     original_items = []
@@ -109,52 +116,57 @@ def preprocess_file(input_path, output_dir, rank, world_size):
     return len(texts)
 
 
-def setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+def merge_ordered_files(temp_files, output_path, buffer_size=8 * 1024 * 1024):
+    """Merge multiple ordered files while maintaining global order"""
+    active_files = []
+    try:
+        # Open all temp files
+        for temp_file in temp_files:
+            f = open(temp_file, "rb")
+            dctx = zstd.ZstdDecompressor()
+            reader = dctx.stream_reader(f)
+            text_reader = io.TextIOWrapper(reader, encoding="utf-8")
+            active_files.append((f, reader, text_reader))
 
+        with open(output_path, "wb", buffering=buffer_size) as final_out:
+            cctx = zstd.ZstdCompressor(level=1)
+            with cctx.stream_writer(final_out) as final_writer:
+                current_pos = 0
+                while True:
+                    next_item = None
+                    next_file_idx = -1
 
-def cleanup():
-    dist.destroy_process_group()
+                    # Find the next item in sequence
+                    for idx, (_, _, reader) in enumerate(active_files):
+                        line = reader.readline()
+                        if not line:
+                            continue
 
+                        try:
+                            item = json.loads(line)
+                            if (
+                                next_item is None
+                                or item["original_position"]
+                                < next_item["original_position"]
+                            ):
+                                next_item = item
+                                next_file_idx = idx
+                        except json.JSONDecodeError:
+                            continue
 
-class OrderedFileReader:
-    """Helper class to read and track items from a file with their positions"""
+                    if next_item is None:
+                        break
 
-    def __init__(self, file_path):
-        self.file = open(file_path, "rb")
-        self.dctx = zstd.ZstdDecompressor()
-        self.reader = self.dctx.stream_reader(self.file)
-        self.text_reader = io.TextIOWrapper(self.reader, encoding="utf-8")
-        self.current_item = None
-        self.exhausted = False
-        self._read_next()
+                    # Write the next item
+                    final_writer.write((json.dumps(next_item) + "\n").encode("utf-8"))
+                    current_pos += 1
 
-    def _read_next(self):
-        try:
-            line = self.text_reader.readline()
-            if not line:
-                self.exhausted = True
-                self.current_item = None
-            else:
-                item = json.loads(line)
-                self.current_item = (item["original_position"], item["data"])
-        except Exception as e:
-            print(f"Error reading line: {e}")
-            self.exhausted = True
-            self.current_item = None
-
-    def get_current(self):
-        return self.current_item
-
-    def advance(self):
-        self._read_next()
-
-    def close(self):
-        self.text_reader.close()
-        self.reader.close()
-        self.file.close()
+    finally:
+        # Clean up file handles
+        for f, reader, text_reader in active_files:
+            text_reader.close()
+            reader.close()
+            f.close()
 
 
 def process_labels(
@@ -176,84 +188,23 @@ def process_labels(
     return item_data
 
 
-def merge_ordered_files(temp_files, output_path, buffer_size=8 * 1024 * 1024):
-    """Merge multiple ordered files while maintaining global order"""
-    # Initialize readers for all temp files
-    readers = [OrderedFileReader(f) for f in temp_files]
-    active_readers = len(readers)
-
-    with open(output_path, "wb", buffering=buffer_size) as final_out:
-        cctx = zstd.ZstdCompressor(level=1)
-        with cctx.stream_writer(final_out) as final_writer:
-            output_position = 0
-            string_buffer = []
-            string_buffer_size = 0
-
-            while active_readers > 0:
-                # Find reader with smallest current position
-                min_pos = float("inf")
-                min_reader_idx = -1
-
-                for idx, reader in enumerate(readers):
-                    if not reader.exhausted:
-                        current = reader.get_current()
-                        if current and current[0] < min_pos:
-                            min_pos = current[0]
-                            min_reader_idx = idx
-
-                if min_reader_idx == -1:
-                    break
-
-                # Verify we're writing in correct order
-                assert (
-                    min_pos == output_position
-                ), f"Position mismatch: expected {output_position}, got {min_pos}"
-
-                # Write the item
-                pos, item = readers[min_reader_idx].get_current()
-                line = json.dumps(item) + "\n"
-                string_buffer.append(line)
-                string_buffer_size += len(line)
-
-                if string_buffer_size >= buffer_size:
-                    final_writer.write("".join(string_buffer).encode("utf-8"))
-                    string_buffer = []
-                    string_buffer_size = 0
-
-                # Advance the reader
-                readers[min_reader_idx].advance()
-                if readers[min_reader_idx].exhausted:
-                    active_readers -= 1
-
-                output_position += 1
-
-            # Write any remaining items
-            if string_buffer:
-                final_writer.write("".join(string_buffer).encode("utf-8"))
-
-    # Close and cleanup readers
-    for reader in readers:
-        reader.close()
-
-
 def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    # Load model
+    # Load model and tokenizer
     model = AutoModelForSequenceClassification.from_pretrained(
         cfg.model_path,
         torch_dtype=torch.bfloat16,
     ).to(device)
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
-    # Create preprocessing directory
-    preprocess_dir = f"{os.path.dirname(cfg.output_path)}/preprocessed"
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
 
     # Stage 1: Preprocess data if not already done
-    preprocess_file_path = f"{preprocess_dir}/preprocessed_{rank}.pt"
+    preprocess_file_path = f"{cfg.preprocess_dir}/preprocessed_{rank}.pt"
     if not os.path.exists(preprocess_file_path):
-        preprocess_file(cfg.input_path, preprocess_dir, rank, world_size)
+        preprocess_file(cfg.input_path, cfg.preprocess_dir, rank, world_size, tokenizer)
 
     # Stage 2: Load preprocessed data and process
     print(f"GPU {rank}: Loading preprocessed data...")
@@ -263,7 +214,6 @@ def process_and_save_ddp(rank, cfg, world_size):
     )
 
     # Initialize data collator for dynamic batching
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
     # Create dataloader with dynamic batching
@@ -331,7 +281,7 @@ def process_and_save_ddp(rank, cfg, world_size):
         for temp_file in temp_files:
             os.remove(temp_file)
         for preprocess_file in [
-            f"{preprocess_dir}/preprocessed_{r}.pt" for r in range(world_size)
+            f"{cfg.preprocess_dir}/preprocessed_{r}.pt" for r in range(world_size)
         ]:
             os.remove(preprocess_file)
 
@@ -346,7 +296,11 @@ def main():
     parser.add_argument(
         "--output_path", default="data/en/1_sample_register_labels.jsonl.zst"
     )
+    parser.add_argument("--preprocess_dir", default="preprocessed_data")
     cfg = parser.parse_args()
+
+    # Create preprocessing directory
+    os.makedirs(cfg.preprocess_dir, exist_ok=True)
 
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
