@@ -49,7 +49,7 @@ def parallel_tokenize(
             batch_texts,
             truncation=True,
             max_length=512,
-            padding=False,
+            padding=True,
             return_tensors="pt",  # Keeps it as PyTorch tensors for efficiency
         )
 
