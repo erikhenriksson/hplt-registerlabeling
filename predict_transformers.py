@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Iterator, Tuple
 import numpy as np
 from torch.cuda.amp import autocast
 import io
-from collections import defaultdict
+import gc
 
 
 def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Dict]]:
@@ -247,6 +247,17 @@ def process_and_save_ddp(rank, cfg, world_size):
         # Clear memory
         chunk_results = None
         dist.barrier()
+
+        # After saving results and before the next chunk
+        if rank == 0:
+            # Clear results immediately
+            all_chunk_results = None
+        chunk_results = None
+        dist.barrier()
+
+        # Add these lines to delete variables and collect garbage
+        del chunk, sorted_indices, encodings, batches, rank_batches
+        gc.collect()
 
         # Print progress (rank 0 only)
         if rank == 0 and chunk_idx % 10 == 0:
