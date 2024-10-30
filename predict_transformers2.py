@@ -40,33 +40,30 @@ def parallel_tokenize(
     texts: List[Dict], tokenizer, batch_size: int = 1000
 ) -> List[Dict]:
     """Tokenize texts in smaller batches to reduce memory usage and clear intermediate results."""
-    all_encodings = []
+    all_encodings = {"input_ids": [], "attention_mask": []}
     for i in range(0, len(texts), batch_size):
         batch_texts = [item["text"] for item in texts[i : i + batch_size]]
 
-        # Tokenize batch-wise
+        # Tokenize batch-wise with padding and truncation enabled
         encodings = tokenizer(
             batch_texts,
             truncation=True,
             max_length=512,
-            padding=True,
-            return_tensors="pt",  # Keeps it as PyTorch tensors for efficiency
+            padding=True,  # Ensure uniform tensor shape within each batch
+            return_tensors="pt",  # Return as PyTorch tensors for efficiency
         )
 
-        # Convert tokenized results to list of dicts to append
-        batch_encodings = [
-            {
-                "input_ids": encodings["input_ids"][j],
-                "attention_mask": encodings["attention_mask"][j],
-            }
-            for j in range(len(batch_texts))
-        ]
-        all_encodings.extend(batch_encodings)
+        # Append tensors from each batch to the overall encoding lists
+        all_encodings["input_ids"].append(encodings["input_ids"])
+        all_encodings["attention_mask"].append(encodings["attention_mask"])
 
         # Clear intermediate data after each batch to reduce memory footprint
-        del batch_texts, batch_encodings, encodings
+        del batch_texts, encodings
         gc.collect()
 
+    # Concatenate all batches into single tensors
+    all_encodings["input_ids"] = torch.cat(all_encodings["input_ids"], dim=0)
+    all_encodings["attention_mask"] = torch.cat(all_encodings["attention_mask"], dim=0)
     return all_encodings
 
 
@@ -77,8 +74,11 @@ def tokenize_and_sort(
     # Tokenize in batches to avoid memory spikes
     encodings = parallel_tokenize(texts, tokenizer)
 
-    # Calculate lengths and sorting indices
-    text_lengths = [(i, len(tokens["input_ids"])) for i, tokens in enumerate(encodings)]
+    # Calculate lengths for sorting
+    text_lengths = [
+        (i, encodings["input_ids"][i].size(0))
+        for i in range(len(encodings["input_ids"]))
+    ]
     text_lengths.sort(key=lambda x: x[1])
     sorted_indices = [i for i, _ in text_lengths]
 
@@ -86,10 +86,7 @@ def tokenize_and_sort(
     for i, idx in enumerate(sorted_indices):
         texts[idx]["original_idx"] = chunk_start_idx + idx
 
-    return sorted_indices, {
-        "input_ids": [e["input_ids"] for e in encodings],
-        "attention_mask": [e["attention_mask"] for e in encodings],
-    }
+    return sorted_indices, encodings
 
 
 def create_length_batches(
