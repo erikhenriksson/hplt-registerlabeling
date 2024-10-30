@@ -54,12 +54,16 @@ def parallel_tokenize(
         )
 
         # Append tensors from each batch to the overall encoding lists
-        all_encodings["input_ids"].append(encodings["input_ids"])
-        all_encodings["attention_mask"].append(encodings["attention_mask"])
+        all_encodings["input_ids"].append(encodings["input_ids"].cpu())  # Move to CPU
+        all_encodings["attention_mask"].append(
+            encodings["attention_mask"].cpu()
+        )  # Move to CPU
 
-        # Clear intermediate data after each batch to reduce memory footprint
+        # Clear intermediate data and force garbage collection to reduce memory footprint
         del batch_texts, encodings
+        tokenizer.backend_tokenizer.clear()  # Clear the tokenizer's cache
         gc.collect()
+        torch.cuda.empty_cache()  # Clear GPU memory if anything remains on GPU
 
     # Concatenate all batches into single tensors
     all_encodings["input_ids"] = torch.cat(all_encodings["input_ids"], dim=0)
