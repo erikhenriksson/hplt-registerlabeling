@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Iterator, Tuple
 import numpy as np
 from torch.cuda.amp import autocast
 import io
-import gc
+from collections import defaultdict
 
 
 def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Dict]]:
@@ -172,6 +172,10 @@ def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     torch.cuda.set_device(rank)
 
+    # Load tokenizer within each process
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, use_fast=False))
+    cfg.tokenizer = tokenizer
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -248,17 +252,6 @@ def process_and_save_ddp(rank, cfg, world_size):
         chunk_results = None
         dist.barrier()
 
-        # After saving results and before the next chunk
-        if rank == 0:
-            # Clear results immediately
-            all_chunk_results = None
-        chunk_results = None
-        dist.barrier()
-
-        # Add these lines to delete variables and collect garbage
-        del chunk, sorted_indices, encodings, batches, rank_batches
-        gc.collect()
-
         # Print progress (rank 0 only)
         if rank == 0 and chunk_idx % 10 == 0:
             print(
@@ -290,11 +283,6 @@ def main():
     parser.add_argument("--output_path", default="output.csv")
 
     cfg = parser.parse_args()
-
-    # Load tokenizer once in the main process
-    global tokenizer  # Make tokenizer globally available
-    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
-    cfg.tokenizer = tokenizer
 
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
