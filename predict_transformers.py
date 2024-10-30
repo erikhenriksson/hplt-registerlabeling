@@ -105,9 +105,15 @@ def process_batch(
     # Move to device
     input_ids = input_ids.to(device)
     attention_mask = attention_mask.to(device)
+    # Synchronize before timing
+    torch.cuda.synchronize()
+    start_time = torch.cuda.Event(enable_timing=True)
+    end_time = torch.cuda.Event(enable_timing=True)
 
+    # Start timing
+    start_time.record()
     # Get predictions
-    with torch.no_grad(), autocast(dtype=torch.bfloat16):
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         # Convert to probabilities while still in autocast
         probs = torch.sigmoid(outputs.logits)
@@ -115,10 +121,17 @@ def process_batch(
     # Convert to float32 before moving to CPU
     probs = probs.float()
 
+    # End timing and synchronize
+    end_time.record()
+    torch.cuda.synchronize()
+
+    # Get time in milliseconds
+    inference_time = start_time.elapsed_time(end_time)
+
+    # Rest of processing (not counted in timing)
     probs = probs.cpu().numpy()
     registers = (probs > 0.5).astype(bool)
 
-    # Format results
     results = []
     for item, prob_row, reg_row in zip(batch_texts, probs, registers):
         results.append(
@@ -129,7 +142,7 @@ def process_batch(
             }
         )
 
-    return results
+    return results, inference_time
 
 
 def save_results(results: List[Dict], output_path: str, mode: str = "w"):
@@ -151,7 +164,6 @@ def cleanup():
 
 
 def process_and_save_ddp(rank, cfg, world_size):
-    """Main processing function for each GPU."""
     setup(rank, world_size)
     torch.cuda.set_device(rank)
 
@@ -161,13 +173,16 @@ def process_and_save_ddp(rank, cfg, world_size):
 
     # Load model
     model = AutoModelForSequenceClassification.from_pretrained(
-        cfg.model_path,
-        # num_labels=25,  # Assuming 25 registers
-        torch_dtype=torch.bfloat16,
+        cfg.model_path, num_labels=25, torch_dtype=torch.bfloat16
     ).to(rank)
 
     model = DDP(model, device_ids=[rank])
     model.eval()
+
+    # Tracking timing
+    total_inference_time = 0
+    total_batches = 0
+    total_examples = 0
 
     # Process data in chunks
     chunk_results = defaultdict(list)
@@ -181,43 +196,60 @@ def process_and_save_ddp(rank, cfg, world_size):
 
         # Tokenize and sort chunk
         sorted_indices, encodings = tokenize_and_sort(chunk, cfg.tokenizer)
-
-        # Create length-based batches with their encodings
         batches = create_length_batches(
             chunk, sorted_indices, encodings, cfg.batch_size
         )
-
-        # Distribute batches across GPUs
         rank_batches = batches[rank::world_size]
 
         # Process batches assigned to this rank
         for batch_idx, (batch_texts, batch_encodings) in enumerate(rank_batches):
-            if rank == 0 and batch_idx % 10 == 0:
-                print(f"GPU 0: Processing batch {batch_idx + 1}/{len(rank_batches)}")
+            results, inference_time = process_batch(
+                batch_texts, batch_encodings, model, rank
+            )
 
-            results = process_batch(batch_texts, batch_encodings, model, rank)
+            # Accumulate timing statistics
+            total_inference_time += inference_time
+            total_batches += 1
+            total_examples += len(batch_texts)
+
             chunk_results[rank].extend(results)
 
-        # Gather results from all ranks
+            # Print timing statistics periodically from GPU 0
+            if rank == 0 and batch_idx % 10 == 0:
+                avg_time_per_batch = total_inference_time / total_batches
+                avg_time_per_example = total_inference_time / total_examples
+                print(
+                    f"GPU 0 Stats - "
+                    f"Avg time per batch: {avg_time_per_batch:.2f}ms, "
+                    f"Avg time per example: {avg_time_per_example:.2f}ms, "
+                    f"Total examples: {total_examples}, "
+                    f"Throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
+                )
+
+        # Rest of the processing (gathering results and saving) remains the same...
         gathered_results = [None] * world_size if rank == 0 else None
         dist.gather_object(chunk_results[rank], gathered_results, dst=0)
 
-        # Save results (rank 0 only)
         if rank == 0:
             all_results = []
             for result_list in gathered_results:
                 all_results.extend(result_list)
-
-            # Save results
             save_results(all_results, cfg.output_path, mode="w" if first_chunk else "a")
-            print(f"Saved results for chunk {chunk_idx + 1}")
             first_chunk = False
 
-        # Clear results for this chunk
         chunk_results[rank] = []
-
-        # Synchronize processes before next chunk
         dist.barrier()
+
+    # Print final timing statistics from GPU 0
+    if rank == 0:
+        print("\nFinal Timing Statistics:")
+        print(f"Total Inference Time: {total_inference_time/1000:.2f} seconds")
+        print(f"Average Time per Batch: {total_inference_time/total_batches:.2f}ms")
+        print(f"Average Time per Example: {total_inference_time/total_examples:.2f}ms")
+        print(f"Total Examples Processed: {total_examples}")
+        print(
+            f"Overall Throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
+        )
 
     cleanup()
 
