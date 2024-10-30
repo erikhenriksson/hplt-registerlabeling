@@ -35,7 +35,7 @@ def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Di
 
 
 def tokenize_and_sort(
-    texts: List[Dict], chunk_start_idx: int
+    texts: List[Dict], chunk_start_idx: int, tokenizer
 ) -> Tuple[List[int], dict]:
     """Tokenize texts and return sorted indices and encodings."""
     # Tokenize all texts at once
@@ -195,7 +195,9 @@ def process_and_save_ddp(rank, cfg, world_size):
         if rank == 0:
             print(f"Processing chunk {chunk_idx + 1}...")
 
-        sorted_indices, encodings = tokenize_and_sort(chunk, chunk_start_idx)
+        sorted_indices, encodings = tokenize_and_sort(
+            chunk, chunk_start_idx, cfg.tokenizer
+        )
         batches = create_length_batches(
             chunk, sorted_indices, encodings, cfg.batch_size
         )
@@ -261,7 +263,7 @@ def main():
 
     # Adjust batch size for multi-GPU
     if world_size > 1:
-        cfg.batch_size = cfg.batch_size * 4
+        cfg.batch_size = cfg.batch_size * world_size
         print(f"Adjusted batch size to {cfg.batch_size} for multi-GPU processing")
 
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
