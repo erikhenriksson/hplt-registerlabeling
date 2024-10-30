@@ -107,12 +107,15 @@ def process_batch(
     attention_mask = attention_mask.to(device)
 
     # Get predictions
-    # with torch.no_grad(), autocast(dtype=torch.bfloat16):
-    with torch.no_grad():
+    with torch.no_grad(), autocast(dtype=torch.bfloat16):
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        # Convert to probabilities while still in autocast
+        probs = torch.sigmoid(outputs.logits)
 
-    # Convert to probabilities
-    probs = torch.sigmoid(outputs.logits.float()).cpu().numpy()
+    # Convert to float32 before moving to CPU
+    probs = probs.float()
+
+    probs = probs.cpu().numpy()
     registers = (probs > 0.5).astype(bool)
 
     # Format results
