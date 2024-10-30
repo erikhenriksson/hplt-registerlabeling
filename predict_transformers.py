@@ -325,7 +325,7 @@ def main():
     # For multiple GPUs, use larger batches to reduce DDP overhead
     if world_size > 1:
         cfg.batch_size = (
-            cfg.batch_size * 4
+            cfg.batch_size * world_size
         )  # Increase batch size significantly for multi-GPU
         print(f"Adjusted batch size to {cfg.batch_size} for multi-GPU processing")
 
