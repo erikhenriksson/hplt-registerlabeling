@@ -172,10 +172,6 @@ def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     torch.cuda.set_device(rank)
 
-    # Load tokenizer within each process
-    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, use_fast=False)
-    cfg.tokenizer = tokenizer
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -199,6 +195,8 @@ def process_and_save_ddp(rank, cfg, world_size):
     for chunk_idx, (chunk_start_idx, chunk) in enumerate(
         read_zst_chunks(cfg.input_path, chunk_size=cfg.chunk_size)
     ):
+        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
+        cfg.tokenizer = tokenizer
         if rank == 0:
             print(f"Processing chunk {chunk_idx + 1}...")
 
@@ -283,6 +281,11 @@ def main():
     parser.add_argument("--output_path", default="output.csv")
 
     cfg = parser.parse_args()
+
+    # Load tokenizer once in the main process
+    global tokenizer  # Make tokenizer globally available
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
+    cfg.tokenizer = tokenizer
 
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
