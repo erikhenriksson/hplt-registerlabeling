@@ -2,119 +2,152 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import pandas as pd
 import json
 import zstandard as zstd
 from argparse import ArgumentParser
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Iterator, Tuple
 import numpy as np
-from itertools import islice
 from torch.cuda.amp import autocast
 import io
+from collections import defaultdict
 
 
-def collate_fn_creator(tokenizer):
-    def collate_fn(batch: List[Dict[str, Any]]):
-        ids = [item["id"] for item in batch]
-        texts = [item["text"] for item in batch]
+def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Dict]]:
+    """Stream data from zst file in chunks."""
+    chunk = []
+    with open(file_path, "rb") as fh:
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(fh) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            for line in text_stream:
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
+                chunk.append(json.loads(line))
+    if chunk:  # Don't forget the last chunk
+        yield chunk
 
-        # Tokenize
-        encodings = tokenizer(
-            texts, padding=True, truncation=True, max_length=512, return_tensors="pt"
+
+def tokenize_and_sort(texts: List[Dict], tokenizer) -> Tuple[List[int], dict]:
+    """Tokenize texts and return sorted indices and encodings."""
+    # Tokenize all texts at once
+    encodings = tokenizer(
+        [item["text"] for item in texts],
+        padding=False,  # No padding yet as we're just getting lengths
+        truncation=True,
+        max_length=512,
+        return_tensors=None,  # Return list of token ids
+    )
+
+    # Get lengths and create index pairs
+    text_lengths = [(i, len(tokens)) for i, tokens in enumerate(encodings["input_ids"])]
+
+    # Sort by length
+    text_lengths.sort(key=lambda x: x[1])
+    sorted_indices = [i for i, _ in text_lengths]
+
+    return sorted_indices, encodings
+
+
+def create_length_batches(
+    texts: List[Dict], sorted_indices: List[int], encodings: dict, batch_size: int
+) -> List[Tuple[List[Dict], dict]]:
+    """Create batches of similar length texts with their encodings."""
+    batches = []
+    current_batch_indices = []
+    current_batch_texts = []
+
+    for idx in sorted_indices:
+        current_batch_indices.append(idx)
+        current_batch_texts.append(texts[idx])
+
+        if len(current_batch_indices) >= batch_size:
+            # Create batch encodings
+            batch_encodings = {
+                "input_ids": [encodings["input_ids"][i] for i in current_batch_indices],
+                "attention_mask": [
+                    encodings["attention_mask"][i] for i in current_batch_indices
+                ],
+            }
+            batches.append((current_batch_texts, batch_encodings))
+            current_batch_indices = []
+            current_batch_texts = []
+
+    if current_batch_texts:  # Don't forget the last batch
+        batch_encodings = {
+            "input_ids": [encodings["input_ids"][i] for i in current_batch_indices],
+            "attention_mask": [
+                encodings["attention_mask"][i] for i in current_batch_indices
+            ],
+        }
+        batches.append((current_batch_texts, batch_encodings))
+
+    return batches
+
+
+def process_batch(
+    batch_texts: List[Dict], batch_encodings: dict, model, device
+) -> List[Dict]:
+    """Process a single batch and return results."""
+    # Pad and convert to tensors
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(x) for x in batch_encodings["input_ids"]], batch_first=True
+    )
+    attention_mask = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(x) for x in batch_encodings["attention_mask"]],
+        batch_first=True,
+        padding_value=0,
+    )
+
+    # Move to device
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+
+    # Get predictions
+    with torch.no_grad(), autocast(dtype=torch.bfloat16):
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+    # Convert to probabilities
+    probs = torch.sigmoid(outputs.logits).cpu().numpy()
+    registers = (probs > 0.5).astype(bool)
+
+    # Format results
+    results = []
+    for item, prob_row, reg_row in zip(batch_texts, probs, registers):
+        results.append(
+            {
+                "id": item["id"],
+                "registers": np.where(reg_row)[0].tolist(),
+                "probabilities": [f"{p:.4f}" for p in prob_row],
+            }
         )
 
-        return {
-            "ids": ids,
-            "input_ids": encodings["input_ids"],
-            "attention_mask": encodings["attention_mask"],
-        }
-
-    return collate_fn
+    return results
 
 
-class StreamingJSONLDataset(Dataset):
-    def __init__(self, file_path: str, tokenizer, chunk_size=1000):
-        self.file_path = file_path
-        self.tokenizer = tokenizer
-        self.chunk_size = chunk_size
-        self.data = []
-        self.current_position = 0
-
-        # Get total number of lines
-        with open(file_path, "rb") as fh:
-            dctx = zstd.ZstdDecompressor()
-            with dctx.stream_reader(fh) as reader:
-                text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-                self.total_lines = sum(1 for _ in text_stream)
-
-        # Load first chunk
-        self._load_next_chunk()
-
-    def _load_next_chunk(self):
-        self.data = []
-        with open(self.file_path, "rb") as fh:
-            dctx = zstd.ZstdDecompressor()
-            with dctx.stream_reader(fh) as reader:
-                text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-                # Skip to current position
-                for _ in islice(text_stream, self.current_position):
-                    pass
-                # Load chunk_size lines
-                for _ in range(self.chunk_size):
-                    try:
-                        line = next(text_stream)
-                        item = json.loads(line)
-                        self.data.append(item)
-                    except StopIteration:
-                        break
-
-    def __len__(self):
-        return self.total_lines
-
-    def __getitem__(self, idx):
-        chunk_idx = idx - self.current_position
-        if chunk_idx >= len(self.data) or chunk_idx < 0:
-            self.current_position = (idx // self.chunk_size) * self.chunk_size
-            self._load_next_chunk()
-            chunk_idx = idx - self.current_position
-
-        item = self.data[chunk_idx]
-        return {"id": item["id"], "text": item["text"]}
+def save_results(results: List[Dict], output_path: str, mode: str = "w"):
+    """Save results to CSV file, either creating new file or appending."""
+    df = pd.DataFrame(results)
+    df.to_csv(output_path, mode=mode, header=(mode == "w"), index=False)
 
 
 def setup(rank, world_size):
+    """Initialize the distributed environment."""
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 
 def cleanup():
+    """Clean up the distributed environment."""
     dist.destroy_process_group()
 
 
-class BatchSampler:
-    def __init__(self, sampler, batch_size):
-        self.sampler = sampler
-        self.batch_size = batch_size
-
-    def __iter__(self):
-        batch = []
-        for idx in self.sampler:
-            batch.append(idx)
-            if len(batch) == self.batch_size:
-                yield batch
-                batch = []
-        if batch:
-            yield batch
-
-    def __len__(self):
-        return (len(self.sampler) + self.batch_size - 1) // self.batch_size
-
-
 def process_and_save_ddp(rank, cfg, world_size):
+    """Main processing function for each GPU."""
     setup(rank, world_size)
     torch.cuda.set_device(rank)
 
@@ -132,82 +165,91 @@ def process_and_save_ddp(rank, cfg, world_size):
     model = DDP(model, device_ids=[rank])
     model.eval()
 
-    # Create dataset and dataloader
-    dataset = StreamingJSONLDataset(cfg.input_path, cfg.tokenizer)
+    # Process data in chunks
+    chunk_results = defaultdict(list)
+    first_chunk = True
 
-    # Create sampler for DDP
-    sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False,  # Keep order for proper gathering
-    )
+    for chunk_idx, chunk in enumerate(
+        read_zst_chunks(cfg.input_path, chunk_size=cfg.chunk_size)
+    ):
+        if rank == 0:
+            print(f"Processing chunk {chunk_idx + 1}...")
 
-    # Create dataloader with custom batch sampler
-    batch_sampler = BatchSampler(sampler, cfg.batch_size)
+        # Tokenize and sort chunk
+        sorted_indices, encodings = tokenize_and_sort(chunk, cfg.tokenizer)
 
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        collate_fn=collate_fn_creator(cfg.tokenizer),
-        num_workers=4,
-    )
+        # Create length-based batches with their encodings
+        batches = create_length_batches(
+            chunk, sorted_indices, encodings, cfg.batch_size
+        )
 
-    # Process data
-    results = []
-    with torch.no_grad():
-        for batch in dataloader:
-            with autocast(dtype=torch.bfloat16):
-                outputs = model(
-                    input_ids=batch["input_ids"].to(rank),
-                    attention_mask=batch["attention_mask"].to(rank),
-                )
+        # Distribute batches across GPUs
+        rank_batches = batches[rank::world_size]
 
-            # Convert logits to probabilities
-            probs = torch.sigmoid(outputs.logits).cpu().numpy()
+        # Process batches assigned to this rank
+        for batch_idx, (batch_texts, batch_encodings) in enumerate(rank_batches):
+            if rank == 0 and batch_idx % 10 == 0:
+                print(f"GPU 0: Processing batch {batch_idx + 1}/{len(rank_batches)}")
 
-            # Get registers above threshold
-            registers = (probs > 0.5).astype(bool)
+            results = process_batch(batch_texts, batch_encodings, model, rank)
+            chunk_results[rank].extend(results)
 
-            # Format results
-            for idx, (id_, prob_row, reg_row) in enumerate(
-                zip(batch["ids"], probs, registers)
-            ):
-                results.append(
-                    {
-                        "id": id_,
-                        "registers": np.where(reg_row)[0].tolist(),
-                        "probabilities": [f"{p:.4f}" for p in prob_row],
-                    }
-                )
+        # Gather results from all ranks
+        gathered_results = [None] * world_size if rank == 0 else None
+        dist.gather_object(chunk_results[rank], gathered_results, dst=0)
 
-    # Gather results from all processes
-    gathered_results = [None] * world_size if rank == 0 else None
-    dist.gather_object(results, gathered_results, dst=0)
+        # Save results (rank 0 only)
+        if rank == 0:
+            all_results = []
+            for result_list in gathered_results:
+                all_results.extend(result_list)
 
-    # Save results (only on rank 0)
-    if rank == 0:
-        all_results = []
-        for result_list in gathered_results:
-            all_results.extend(result_list)
-        df = pd.DataFrame(all_results)
-        df.to_csv(cfg.output_path, index=False)
+            # Save results
+            save_results(all_results, cfg.output_path, mode="w" if first_chunk else "a")
+            print(f"Saved results for chunk {chunk_idx + 1}")
+            first_chunk = False
+
+        # Clear results for this chunk
+        chunk_results[rank] = []
+
+        # Synchronize processes before next chunk
+        dist.barrier()
 
     cleanup()
 
 
 def main():
-    parser = ArgumentParser()
-    parser.add_argument("--base_model", default="xlm-roberta-base")
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--model_path", default="models/xlm-roberta-base")
-    parser.add_argument("--input_path", default="data/en/1_sample.jsonl.zst")
-    parser.add_argument("--output_path", default="output.csv")
-    parser.add_argument("--preprocess_dir", default="preprocessed_data")
+    parser = ArgumentParser(
+        description="Process large text files with register classification"
+    )
+    parser.add_argument(
+        "--base_model",
+        default="xlm-roberta-base",
+        help="Base model to use for tokenizer",
+    )
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size per GPU")
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=10000,
+        help="Number of examples to process at once",
+    )
+    parser.add_argument(
+        "--model_path",
+        default="models/xlm-roberta-base",
+        help="Path to the fine-tuned model",
+    )
+    parser.add_argument(
+        "--input_path", default="data/input.jsonl.zst", help="Path to input zst file"
+    )
+    parser.add_argument(
+        "--output_path", default="output.csv", help="Path to output CSV file"
+    )
 
     cfg = parser.parse_args()
 
     # Load tokenizer once in the main process
+    print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
     cfg.tokenizer = tokenizer
 
@@ -216,7 +258,10 @@ def main():
     print(f"Running with {world_size} GPUs")
 
     # Launch DDP processes
+    print("Starting distributed processing...")
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
+
+    print("Processing complete!")
 
 
 if __name__ == "__main__":
