@@ -225,6 +225,9 @@ def process_and_save_ddp(rank, cfg, world_size):
 
             chunk_results.extend(results)
 
+            results = None
+            gc.collect()
+
         # Gather results from all ranks for this chunk
         gathered_results = [None] * world_size if rank == 0 else None
         dist.gather_object(chunk_results, gathered_results, dst=0)
