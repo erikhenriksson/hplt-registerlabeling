@@ -119,6 +119,44 @@ def cleanup():
     dist.destroy_process_group()
 
 
+class OrderedFileReader:
+    """Helper class to read and track items from a file with their positions"""
+
+    def __init__(self, file_path):
+        self.file = open(file_path, "rb")
+        self.dctx = zstd.ZstdDecompressor()
+        self.reader = self.dctx.stream_reader(self.file)
+        self.text_reader = io.TextIOWrapper(self.reader, encoding="utf-8")
+        self.current_item = None
+        self.exhausted = False
+        self._read_next()
+
+    def _read_next(self):
+        try:
+            line = self.text_reader.readline()
+            if not line:
+                self.exhausted = True
+                self.current_item = None
+            else:
+                item = json.loads(line)
+                self.current_item = (item["original_position"], item["data"])
+        except Exception as e:
+            print(f"Error reading line: {e}")
+            self.exhausted = True
+            self.current_item = None
+
+    def get_current(self):
+        return self.current_item
+
+    def advance(self):
+        self._read_next()
+
+    def close(self):
+        self.text_reader.close()
+        self.reader.close()
+        self.file.close()
+
+
 def process_labels(
     item_data, prob, pred_label, labels_all, child_to_parent, label_to_index
 ):
