@@ -344,6 +344,7 @@ def process_and_save_ddp(rank, cfg, world_size):
 
 def main():
     parser = ArgumentParser()
+    parser.add_argument("--base_model", default="xlm-roberta-base")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/en/1_sample.jsonl.zst")
@@ -357,7 +358,7 @@ def main():
     os.makedirs(cfg.preprocess_dir, exist_ok=True)
 
     # Load tokenizer once in the main process
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
     cfg.tokenizer = tokenizer
 
     world_size = torch.cuda.device_count()
