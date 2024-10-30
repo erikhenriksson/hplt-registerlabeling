@@ -16,6 +16,25 @@ from torch.cuda.amp import autocast
 import io
 
 
+def collate_fn_creator(tokenizer):
+    def collate_fn(batch: List[Dict[str, Any]]):
+        ids = [item["id"] for item in batch]
+        texts = [item["text"] for item in batch]
+
+        # Tokenize
+        encodings = tokenizer(
+            texts, padding=True, truncation=True, max_length=512, return_tensors="pt"
+        )
+
+        return {
+            "ids": ids,
+            "input_ids": encodings["input_ids"],
+            "attention_mask": encodings["attention_mask"],
+        }
+
+    return collate_fn
+
+
 class StreamingJSONLDataset(Dataset):
     def __init__(self, file_path: str, tokenizer, chunk_size=1000):
         self.file_path = file_path
@@ -66,22 +85,6 @@ class StreamingJSONLDataset(Dataset):
         return {"id": item["id"], "text": item["text"]}
 
 
-def collate_fn(batch: List[Dict[str, Any]], tokenizer):
-    ids = [item["id"] for item in batch]
-    texts = [item["text"] for item in batch]
-
-    # Tokenize
-    encodings = tokenizer(
-        texts, padding=True, truncation=True, max_length=512, return_tensors="pt"
-    )
-
-    return {
-        "ids": ids,
-        "input_ids": encodings["input_ids"],
-        "attention_mask": encodings["attention_mask"],
-    }
-
-
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
@@ -90,6 +93,25 @@ def setup(rank, world_size):
 
 def cleanup():
     dist.destroy_process_group()
+
+
+class BatchSampler:
+    def __init__(self, sampler, batch_size):
+        self.sampler = sampler
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        batch = []
+        for idx in self.sampler:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def __len__(self):
+        return (len(self.sampler) + self.batch_size - 1) // self.batch_size
 
 
 def process_and_save_ddp(rank, cfg, world_size):
@@ -115,24 +137,19 @@ def process_and_save_ddp(rank, cfg, world_size):
 
     # Create sampler for DDP
     sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,  # Keep order for proper gathering
     )
 
-    # Create dataloader with dynamic batching
-    def batch_sampler(sampler, batch_size):
-        batch = []
-        for idx in sampler:
-            batch.append(idx)
-            if len(batch) == batch_size:
-                yield batch
-                batch = []
-        if batch:
-            yield batch
+    # Create dataloader with custom batch sampler
+    batch_sampler = BatchSampler(sampler, cfg.batch_size)
 
     dataloader = DataLoader(
         dataset,
-        batch_sampler=batch_sampler(sampler, cfg.batch_size),
-        collate_fn=lambda b: collate_fn(b, cfg.tokenizer),
+        batch_sampler=batch_sampler,
+        collate_fn=collate_fn_creator(cfg.tokenizer),
         num_workers=4,
     )
 
@@ -165,18 +182,16 @@ def process_and_save_ddp(rank, cfg, world_size):
                 )
 
     # Gather results from all processes
-    all_results = []
-    if rank == 0:
-        all_results.extend(results)
-        for i in range(1, world_size):
-            all_results.extend(dist.gather(results, dst=0))
-    else:
-        dist.gather(results, dst=0)
+    gathered_results = [None] * world_size if rank == 0 else None
+    dist.gather_object(results, gathered_results, dst=0)
 
     # Save results (only on rank 0)
     if rank == 0:
+        all_results = []
+        for result_list in gathered_results:
+            all_results.extend(result_list)
         df = pd.DataFrame(all_results)
-        df.to_csv("output.csv", index=False)
+        df.to_csv(cfg.output_path, index=False)
 
     cleanup()
 
