@@ -199,7 +199,7 @@ def process_and_save_ddp(rank, cfg, world_size):
     ).to(device)
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
+    tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
 
     # Stage 1: Preprocess data if not already done
     preprocess_file_path = f"{cfg.preprocess_dir}/preprocessed_{rank}.pt"
