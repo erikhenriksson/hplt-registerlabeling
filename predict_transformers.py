@@ -108,7 +108,8 @@ def process_batch(
 
     # Get predictions
     # with torch.no_grad(), autocast(dtype=torch.bfloat16):
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
     # Convert to probabilities
     probs = torch.sigmoid(outputs.logits).cpu().numpy()
