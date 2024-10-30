@@ -13,12 +13,13 @@ import numpy as np
 from torch.cuda.amp import autocast
 import io
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 
-def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Dict]]:
-    """Stream data from zst file in chunks."""
+def read_zst_chunks(file_path: str, chunk_size: int = 1000) -> Iterator[List[Dict]]:
+    """Stream data from zst file in smaller chunks to manage memory."""
     chunk = []
-    chunk_start_idx = 0  # Track starting index of each chunk
+    chunk_start_idx = 0
     with open(file_path, "rb") as fh:
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(fh) as reader:
@@ -30,41 +31,43 @@ def read_zst_chunks(file_path: str, chunk_size: int = 10000) -> Iterator[List[Di
                     chunk_start_idx = line_idx
                 item = json.loads(line)
                 chunk.append(item)
-    if chunk:  # Don't forget the last chunk
+    if chunk:
         yield chunk_start_idx, chunk
+
+
+def parallel_tokenize(texts: List[Dict], tokenizer) -> List[Dict]:
+    """Parallelize tokenization to reduce CPU bottleneck."""
+    with ThreadPoolExecutor() as executor:
+        encoded_texts = list(
+            executor.map(
+                lambda item: tokenizer(item["text"], truncation=True, max_length=512),
+                texts,
+            )
+        )
+    return encoded_texts
 
 
 def tokenize_and_sort(
     texts: List[Dict], chunk_start_idx: int, tokenizer
 ) -> Tuple[List[int], dict]:
-    """Tokenize texts and return sorted indices and encodings."""
-    # Tokenize all texts at once
-    encodings = tokenizer(
-        [item["text"] for item in texts],
-        padding=False,  # No padding yet as we're just getting lengths
-        truncation=True,
-        max_length=512,
-        return_tensors=None,  # Return list of token ids
-    )
-
-    # Get lengths and create index pairs
-    text_lengths = [(i, len(tokens)) for i, tokens in enumerate(encodings["input_ids"])]
-
-    # Sort by length but keep track of original position
+    """Tokenize texts with optimized sorting and add original index for tracking."""
+    # Tokenize texts in parallel
+    encodings = parallel_tokenize(texts, tokenizer)
+    text_lengths = [(i, len(tokens["input_ids"])) for i, tokens in enumerate(encodings)]
     text_lengths.sort(key=lambda x: x[1])
     sorted_indices = [i for i, _ in text_lengths]
-
-    # Add original global index to each item
     for i, idx in enumerate(sorted_indices):
         texts[idx]["original_idx"] = chunk_start_idx + idx
-
-    return sorted_indices, encodings
+    return sorted_indices, {
+        "input_ids": [e["input_ids"] for e in encodings],
+        "attention_mask": [e["attention_mask"] for e in encodings],
+    }
 
 
 def create_length_batches(
     texts: List[Dict], sorted_indices: List[int], encodings: dict, batch_size: int
 ) -> List[Tuple[List[Dict], dict]]:
-    """Create batches of similar length texts with their encodings."""
+    """Create batches with dynamically managed padding reduction."""
     batches = []
     current_batch_indices = []
     current_batch_texts = []
@@ -99,7 +102,7 @@ def create_length_batches(
 def process_batch(
     batch_texts: List[Dict], batch_encodings: dict, model, device
 ) -> Tuple[List[Dict], float]:
-    """Process a single batch and return results with timing."""
+    """Process a batch with padding optimization and track inference timing."""
     input_ids = torch.nn.utils.rnn.pad_sequence(
         [torch.tensor(x) for x in batch_encodings["input_ids"]], batch_first=True
     )
@@ -138,22 +141,18 @@ def process_batch(
                 "id": item["id"],
                 "registers": np.where(reg_row)[0].tolist(),
                 "probabilities": [f"{p:.4f}" for p in prob_row],
-                "original_idx": item["original_idx"],  # Keep track of original position
+                "original_idx": item["original_idx"],
             }
         )
 
     return results, inference_time
 
 
-def save_results(results: List[Dict], output_path: str, mode: str = "w"):
-    """Save results to CSV file in original order."""
-    # Sort by original index before saving
+def save_results(results: List[Dict], output_path: str, mode: str = "a"):
+    """Save results using the original order, optimized with file appending."""
     results.sort(key=lambda x: x["original_idx"])
-
-    # Remove the temporary original_idx field
     for result in results:
         del result["original_idx"]
-
     df = pd.DataFrame(results)
     df.to_csv(output_path, mode=mode, header=(mode == "w"), index=False)
 
@@ -171,7 +170,6 @@ def cleanup():
 def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     torch.cuda.set_device(rank)
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -186,18 +184,13 @@ def process_and_save_ddp(rank, cfg, world_size):
     total_batches = 0
     total_examples = 0
 
-    # Initialize output file (rank 0 only)
     if rank == 0:
         with open(cfg.output_path, "w") as f:
             f.write("id,registers,probabilities\n")
 
-    # Process data in chunks
     for chunk_idx, (chunk_start_idx, chunk) in enumerate(
         read_zst_chunks(cfg.input_path, chunk_size=cfg.chunk_size)
     ):
-        if rank == 0:
-            print(f"Processing chunk {chunk_idx + 1}...")
-
         sorted_indices, encodings = tokenize_and_sort(
             chunk, chunk_start_idx, cfg.tokenizer
         )
@@ -206,7 +199,6 @@ def process_and_save_ddp(rank, cfg, world_size):
         )
         rank_batches = batches[rank::world_size]
 
-        # Process each batch and save results immediately
         chunk_results = []
         for batch_idx, (batch_texts, batch_encodings) in enumerate(rank_batches):
             results, inference_time = process_batch(
@@ -219,48 +211,33 @@ def process_and_save_ddp(rank, cfg, world_size):
 
             chunk_results.extend(results)
 
-        # Gather results from all ranks for this chunk
         gathered_results = [None] * world_size if rank == 0 else None
         dist.gather_object(chunk_results, gathered_results, dst=0)
 
-        # Save results from this chunk (rank 0 only)
         if rank == 0:
             all_chunk_results = []
             for result_list in gathered_results:
                 if result_list:
                     all_chunk_results.extend(result_list)
-
-            # Sort by original index within this chunk
-            all_chunk_results.sort(key=lambda x: x["original_idx"])
-
-            # Save to file immediately
-            with open(cfg.output_path, "a") as f:
-                for result in all_chunk_results:
-                    # Format the line manually to avoid DataFrame overhead
-                    f.write(
-                        f"{result['id']},{result['registers']},{result['probabilities']}\n"
-                    )
-
-            # Clear results immediately
+            save_results(all_chunk_results, cfg.output_path, mode="a")
             all_chunk_results = None
 
-        # Clear memory
         chunk_results = None
         dist.barrier()
 
-        # Print progress (rank 0 only)
         if rank == 0 and chunk_idx % 10 == 0:
             print(
                 f"Processed {total_examples} examples. "
                 f"Current throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
             )
 
-    # Print final statistics (rank 0 only)
     if rank == 0:
         print("\nFinal Timing Statistics:")
-        print(f"Total Inference Time: {total_inference_time/1000:.2f} seconds")
-        print(f"Average Time per Batch: {total_inference_time/total_batches:.2f}ms")
-        print(f"Average Time per Example: {total_inference_time/total_examples:.2f}ms")
+        print(f"Total Inference Time: {total_inference_time / 1000:.2f} seconds")
+        print(f"Average Time per Batch: {total_inference_time / total_batches:.2f}ms")
+        print(
+            f"Average Time per Example: {total_inference_time / total_examples:.2f}ms"
+        )
         print(f"Total Examples Processed: {total_examples}")
         print(
             f"Overall Throughput: {1000 * total_examples / total_inference_time:.2f} examples/sec"
@@ -273,7 +250,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("--base_model", default="xlm-roberta-base")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--chunk_size", type=int, default=5000)
+    parser.add_argument("--chunk_size", type=int, default=1000)
     parser.add_argument("--model_path", default="models/xlm-roberta-base")
     parser.add_argument("--input_path", default="data/input.jsonl.zst")
     parser.add_argument("--output_path", default="output.csv")
@@ -281,7 +258,7 @@ def main():
     cfg = parser.parse_args()
 
     # Load tokenizer once in the main process
-    global tokenizer  # Make tokenizer globally available
+    global tokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
     cfg.tokenizer = tokenizer
 
