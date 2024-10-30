@@ -6,19 +6,12 @@ import io
 import torch
 from tqdm.auto import tqdm
 from argparse import ArgumentParser
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    DataCollatorWithPadding,
-)
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from torch.nn.functional import sigmoid
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
-# Enable TF32
-torch.set_float32_matmul_precision("high")
 
 # Labels structure
 labels_structure = {
@@ -58,16 +51,81 @@ class PreprocessedDataset(Dataset):
         self.original_items = original_items
         self.positions = positions
 
+        # Calculate lengths for dynamic batching
+        self.lengths = [len(ids) for ids in self.encodings["input_ids"]]
+
     def __getitem__(self, idx):
         return {
-            "input_ids": self.encodings["input_ids"][idx],
-            "attention_mask": self.encodings["attention_mask"][idx],
+            "input_ids": torch.tensor(self.encodings["input_ids"][idx]),
+            "attention_mask": torch.tensor(self.encodings["attention_mask"][idx]),
             "original_item": self.original_items[idx],
             "position": self.positions[idx],
+            "length": self.lengths[idx],
         }
 
     def __len__(self):
         return len(self.positions)
+
+
+def custom_collate_fn(batch):
+    """Custom collate function for dynamic batching"""
+    # Sort batch by length
+    batch = sorted(batch, key=lambda x: x["length"], reverse=True)
+
+    # Separate features that need padding from other features
+    input_ids = [item["input_ids"] for item in batch]
+    attention_mask = [item["attention_mask"] for item in batch]
+
+    # Get max length in this batch
+    max_length = max(len(ids) for ids in input_ids)
+
+    # Pad sequences in this batch
+    padded_input_ids = torch.zeros((len(batch), max_length), dtype=torch.long)
+    padded_attention_mask = torch.zeros((len(batch), max_length), dtype=torch.long)
+
+    for i, (ids, mask) in enumerate(zip(input_ids, attention_mask)):
+        padded_input_ids[i, : len(ids)] = ids
+        padded_attention_mask[i, : len(mask)] = mask
+
+    return {
+        "input_ids": padded_input_ids,
+        "attention_mask": padded_attention_mask,
+        "original_item": [item["original_item"] for item in batch],
+        "position": torch.tensor([item["position"] for item in batch]),
+    }
+
+
+def length_bucketed_sampler(lengths, batch_size):
+    """Create batches of similar lengths"""
+    # Sort indices by length
+    indices = list(range(len(lengths)))
+    indices.sort(key=lambda i: lengths[i])
+
+    # Create batches with similar lengths
+    batches = []
+    for i in range(0, len(indices), batch_size):
+        batches.append(indices[i : i + batch_size])
+
+    return batches
+
+
+def process_labels(
+    item_data, prob, pred_label, labels_all, child_to_parent, label_to_index
+):
+    """Process labels for an item"""
+    labels_indexes = pred_label.tolist()
+
+    active_labels = set()
+    for i, is_active in enumerate(labels_indexes):
+        if is_active == 1:
+            label = labels_all[i]
+            active_labels.add(label)
+            if label in child_to_parent:
+                active_labels.add(child_to_parent[label])
+
+    item_data["registers"] = list(active_labels)
+    item_data["register_probabilities"] = [round(float(p), 4) for p in prob.tolist()]
+    return item_data
 
 
 def preprocess_file(input_path, output_dir, rank, world_size, tokenizer):
@@ -169,37 +227,19 @@ def merge_ordered_files(temp_files, output_path, buffer_size=8 * 1024 * 1024):
             f.close()
 
 
-def process_labels(
-    item_data, prob, pred_label, labels_all, child_to_parent, label_to_index
-):
-    """Optimized label processing using sets"""
-    labels_indexes = pred_label.tolist()
-
-    active_labels = set()
-    for i, is_active in enumerate(labels_indexes):
-        if is_active == 1:
-            label = labels_all[i]
-            active_labels.add(label)
-            if label in child_to_parent:
-                active_labels.add(child_to_parent[label])
-
-    item_data["registers"] = list(active_labels)
-    item_data["register_probabilities"] = [round(float(p), 4) for p in prob.tolist()]
-    return item_data
-
-
 def process_and_save_ddp(rank, cfg, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    # Load model and tokenizer
+    # Load model for this GPU
     model = AutoModelForSequenceClassification.from_pretrained(
         cfg.model_path,
         torch_dtype=torch.bfloat16,
     ).to(device)
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
-    tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
+    # Use tokenizer from config
+    tokenizer = cfg.tokenizer
 
     # Stage 1: Preprocess data if not already done
     preprocess_file_path = f"{cfg.preprocess_dir}/preprocessed_{rank}.pt"
@@ -213,15 +253,15 @@ def process_and_save_ddp(rank, cfg, world_size):
         data["encodings"], data["original_items"], data["positions"]
     )
 
-    # Initialize data collator for dynamic batching
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+    # Create batches based on sequence lengths
+    batch_sampler = length_bucketed_sampler(dataset.lengths, cfg.batch_size)
 
-    # Create dataloader with dynamic batching
+    # Create dataloader with custom collation and batch sampler
     dataloader = DataLoader(
         dataset,
-        batch_size=cfg.batch_size,
-        collate_fn=data_collator,
-        shuffle=False,  # Keep original order
+        batch_sampler=batch_sampler,
+        collate_fn=custom_collate_fn,
+        num_workers=4,
     )
 
     # Process batches
@@ -231,11 +271,21 @@ def process_and_save_ddp(rank, cfg, world_size):
     print(f"GPU {rank}: Starting inference...")
     model.eval()
 
+    # Track padding efficiency
+    total_tokens = 0
+    total_padding = 0
+
     with torch.no_grad():
         for batch in tqdm(dataloader, disable=rank != 0):
             # Move inputs to GPU
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+
+            # Calculate padding efficiency for this batch
+            batch_total = input_ids.numel()
+            batch_padding = (attention_mask == 0).sum().item()
+            total_tokens += batch_total
+            total_padding += batch_padding
 
             # Get predictions
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -253,6 +303,10 @@ def process_and_save_ddp(rank, cfg, world_size):
                     label_to_index,
                 )
                 results.append((batch["position"][idx].item(), processed_item))
+
+    # Print padding efficiency stats
+    padding_percentage = (total_padding / total_tokens) * 100
+    print(f"GPU {rank}: Padding percentage: {padding_percentage:.2f}%")
 
     # Sort results by position
     results.sort(key=lambda x: x[0])
@@ -280,10 +334,10 @@ def process_and_save_ddp(rank, cfg, world_size):
         # Clean up temp files and preprocessed data
         for temp_file in temp_files:
             os.remove(temp_file)
-        for preprocess_filee in [
+        for preprocessed_data_file in [
             f"{cfg.preprocess_dir}/preprocessed_{r}.pt" for r in range(world_size)
         ]:
-            os.remove(preprocess_filee)
+            os.remove(preprocessed_data_file)
 
     cleanup()
 
@@ -301,6 +355,10 @@ def main():
 
     # Create preprocessing directory
     os.makedirs(cfg.preprocess_dir, exist_ok=True)
+
+    # Load tokenizer once in the main process
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path)
+    cfg.tokenizer = tokenizer
 
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
