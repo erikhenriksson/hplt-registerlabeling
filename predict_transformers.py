@@ -41,27 +41,38 @@ def tokenize_and_sort(
     texts: List[Dict], chunk_start_idx: int, tokenizer
 ) -> Tuple[List[int], dict]:
     """Tokenize texts and return sorted indices and encodings."""
-    # Tokenize all texts at once
-    encodings = tokenizer(
-        [item["text"] for item in texts],
-        padding=False,  # No padding yet as we're just getting lengths
-        truncation=True,
-        max_length=512,
-        return_tensors=None,  # Return list of token ids
-    )
+    encodings = {'input_ids': [], 'attention_mask': []}
+    text_lengths = []
 
-    # Get lengths and create index pairs
-    text_lengths = [(i, len(tokens)) for i, tokens in enumerate(encodings["input_ids"])]
+    for i, item in enumerate(texts):
+        encoding = tokenizer.encode_plus(
+            item["text"],
+            padding=False,
+            truncation=True,
+            max_length=512
+            return_tensors=None,
+        )
+        encodings['input_ids'].append(encoding['input_ids'])
+        encodings['attention_mask'].append(encoding['attention_mask'])
+        length = len(encoding['input_ids'])
+        text_lengths.append((i, length))
+        # Clear encoding to free memory
+        encoding = None
 
     # Sort by length but keep track of original position
     text_lengths.sort(key=lambda x: x[1])
     sorted_indices = [i for i, _ in text_lengths]
 
     # Add original global index to each item
-    for i, idx in enumerate(sorted_indices):
+    for idx in sorted_indices:
         texts[idx]["original_idx"] = chunk_start_idx + idx
 
+    # Clear text_lengths to free memory
+    text_lengths = None
+    gc.collect()
+
     return sorted_indices, encodings
+
 
 
 def create_length_batches(
