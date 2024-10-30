@@ -144,7 +144,9 @@ def process_batch(
                 "original_idx": item["original_idx"],  # Keep track of original position
             }
         )
-
+    # Delete probs and registers
+    del probs, registers
+    gc.collect()
     return results, inference_time
 
 
