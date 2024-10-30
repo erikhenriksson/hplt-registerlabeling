@@ -41,7 +41,7 @@ def tokenize_and_sort(
     texts: List[Dict], chunk_start_idx: int, tokenizer
 ) -> Tuple[List[int], dict]:
     """Tokenize texts and return sorted indices and encodings."""
-    encodings = {'input_ids': [], 'attention_mask': []}
+    encodings = {"input_ids": [], "attention_mask": []}
     text_lengths = []
 
     for i, item in enumerate(texts):
@@ -49,12 +49,12 @@ def tokenize_and_sort(
             item["text"],
             padding=False,
             truncation=True,
-            max_length=512
+            max_length=512,
             return_tensors=None,
         )
-        encodings['input_ids'].append(encoding['input_ids'])
-        encodings['attention_mask'].append(encoding['attention_mask'])
-        length = len(encoding['input_ids'])
+        encodings["input_ids"].append(encoding["input_ids"])
+        encodings["attention_mask"].append(encoding["attention_mask"])
+        length = len(encoding["input_ids"])
         text_lengths.append((i, length))
         # Clear encoding to free memory
         encoding = None
@@ -72,7 +72,6 @@ def tokenize_and_sort(
     gc.collect()
 
     return sorted_indices, encodings
-
 
 
 def create_length_batches(
