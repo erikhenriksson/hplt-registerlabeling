@@ -288,7 +288,9 @@ def main():
         default="xlm-roberta-base",
         help="Base model to use for tokenizer",
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size per GPU")
+    parser.add_argument(
+        "--batch_size", type=int, default=32, help="Base batch size per GPU"
+    )
     parser.add_argument(
         "--chunk_size",
         type=int,
@@ -318,12 +320,15 @@ def main():
     world_size = torch.cuda.device_count()
     print(f"Running with {world_size} GPUs")
 
+    # Adjust batch size based on number of GPUs
+    # For single GPU, keep original batch size
+    # For multiple GPUs, use larger batches to reduce DDP overhead
+    if world_size > 1:
+        cfg.batch_size = (
+            cfg.batch_size * 4
+        )  # Increase batch size significantly for multi-GPU
+        print(f"Adjusted batch size to {cfg.batch_size} for multi-GPU processing")
+
     # Launch DDP processes
     print("Starting distributed processing...")
     mp.spawn(process_and_save_ddp, args=(cfg, world_size), nprocs=world_size, join=True)
-
-    print("Processing complete!")
-
-
-if __name__ == "__main__":
-    main()
