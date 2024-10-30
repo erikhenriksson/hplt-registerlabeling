@@ -16,6 +16,63 @@ from collections import defaultdict
 import gc
 
 
+def tokenize_and_sort(
+    texts: List[Dict], chunk_start_idx: int, tokenizer
+) -> Tuple[List[int], dict]:
+    """Tokenize texts in batches to control memory usage and add sorting for efficient processing."""
+    # Tokenize in batches to avoid memory spikes
+    encodings = parallel_tokenize(texts, tokenizer)
+
+    # Calculate lengths for sorting
+    text_lengths = [
+        (i, encodings["input_ids"][i].size(0))
+        for i in range(len(encodings["input_ids"]))
+    ]
+    text_lengths.sort(key=lambda x: x[1])
+    sorted_indices = [i for i, _ in text_lengths]
+
+    # Add original index for tracking
+    for i, idx in enumerate(sorted_indices):
+        texts[idx]["original_idx"] = chunk_start_idx + idx
+
+    return sorted_indices, encodings
+
+
+def create_length_batches(
+    texts: List[Dict], sorted_indices: List[int], encodings: dict, batch_size: int
+) -> List[Tuple[List[Dict], dict]]:
+    """Create batches with dynamically managed padding reduction."""
+    batches = []
+    current_batch_indices = []
+    current_batch_texts = []
+
+    for idx in sorted_indices:
+        current_batch_indices.append(idx)
+        current_batch_texts.append(texts[idx])
+
+        if len(current_batch_indices) >= batch_size:
+            batch_encodings = {
+                "input_ids": [encodings["input_ids"][i] for i in current_batch_indices],
+                "attention_mask": [
+                    encodings["attention_mask"][i] for i in current_batch_indices
+                ],
+            }
+            batches.append((current_batch_texts, batch_encodings))
+            current_batch_indices = []
+            current_batch_texts = []
+
+    if current_batch_texts:
+        batch_encodings = {
+            "input_ids": [encodings["input_ids"][i] for i in current_batch_indices],
+            "attention_mask": [
+                encodings["attention_mask"][i] for i in current_batch_indices
+            ],
+        }
+        batches.append((current_batch_texts, batch_encodings))
+
+    return batches
+
+
 def read_zst_chunks(file_path: str, chunk_size: int = 1000) -> Iterator[List[Dict]]:
     """Stream data from zst file in smaller chunks to manage memory."""
     chunk = []
