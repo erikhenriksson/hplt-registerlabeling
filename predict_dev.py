@@ -13,6 +13,8 @@ from torch.nn.functional import sigmoid
 from itertools import islice
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+import psutil
+import gc
 import torch.multiprocessing as mp
 
 # Enable TF32
@@ -117,83 +119,135 @@ def batch_process(
     processed_count = 0
 
     while True:
+        # Process data in smaller chunks to prevent memory accumulation
         large_batch = list(islice(data_iterator, max_batch_length))
         if not large_batch:
             break
 
+        # Clear memory from previous iteration
+        gc.collect()
+
         # Unpack the position and line data
         positions, lines = zip(*large_batch)
-        text_data = [(idx, json.loads(line)) for idx, line in zip(positions, lines)]
-        texts = [item[1]["text"] for item in text_data]
 
-        encodings = tokenizer(
-            texts,
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-            return_tensors=None,
-        )
+        # Process text data in smaller chunks to prevent memory buildup
+        chunk_size = 1000
+        for chunk_start in range(0, len(lines), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(lines))
 
-        lengths = [len(ids) for ids in encodings["input_ids"]]
-        sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+            # Process only the current chunk
+            chunk_lines = lines[chunk_start:chunk_end]
+            chunk_positions = positions[chunk_start:chunk_end]
 
-        processed_results = []
+            # Parse JSON and extract text in a memory-efficient way
+            text_data = []
+            for idx, line in zip(chunk_positions, chunk_lines):
+                try:
+                    parsed_data = json.loads(line)
+                    text_data.append((idx, parsed_data))
+                except json.JSONDecodeError:
+                    continue
 
-        for i in range(0, len(sorted_indices), batch_size):
-            current_batch_size = min(batch_size, len(sorted_indices) - i)
-            batch_indices = sorted_indices[i : i + current_batch_size]
+            texts = [item[1]["text"] for item in text_data]
 
-            batch_items = [text_data[idx][1] for idx in batch_indices]
-            batch_positions = [text_data[idx][0] for idx in batch_indices]
-            batch_encodings = {
-                key: [encodings[key][idx] for idx in batch_indices]
-                for key in encodings.keys()
-            }
+            # Tokenize in smaller batches to prevent memory accumulation
+            tokenizer_batch_size = 100
+            all_encodings = []
 
-            # Get the maximum length in this batch
-            current_length = max(len(seq) for seq in batch_encodings["input_ids"])
-
-            # Reset buffers to zero
-            input_ids_buffer.zero_()
-            attention_mask_buffer.zero_()
-
-            # Fill the pre-allocated buffers
-            for j, seq in enumerate(batch_encodings["input_ids"]):
-                seq_len = len(seq)
-                input_ids_buffer[j, :seq_len].copy_(
-                    torch.tensor(seq, dtype=torch.long, device=device)
+            for i in range(0, len(texts), tokenizer_batch_size):
+                batch_texts = texts[i : i + tokenizer_batch_size]
+                encodings = tokenizer(
+                    batch_texts,
+                    truncation=True,
+                    max_length=max_length,
+                    padding=False,
+                    return_tensors=None,
                 )
-                attention_mask_buffer[j, :seq_len] = 1
-
-            # Use views of the buffers for the current batch
-            input_ids = input_ids_buffer[:current_batch_size, :current_length]
-            attention_mask = attention_mask_buffer[:current_batch_size, :current_length]
-
-            with torch.no_grad():
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                probabilities = sigmoid(outputs.logits)
-                predicted_labels = (probabilities > 0.5).int()
-
-            for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
-                zip(batch_items, probabilities, predicted_labels, batch_positions)
-            ):
-                processed_item = process_labels(
-                    item_data.copy(),
-                    prob,
-                    pred_label,
-                    labels_all,
-                    child_to_parent,
-                    label_to_index,
+                all_encodings.extend(
+                    [
+                        {k: v[i] for k, v in encodings.items()}
+                        for i in range(len(batch_texts))
+                    ]
                 )
-                processed_results.append((orig_pos, processed_item))
-                processed_count += 1
 
-            if rank == 0 and processed_count % 1000 == 0:
-                print(f"GPU {rank}: Processed {processed_count} items")
+                # Clear memory after each tokenization batch
+                del encodings
+                gc.collect()
 
-        # Sort by original position before yielding
-        processed_results.sort(key=lambda x: x[0])
-        yield processed_results
+            lengths = [len(enc["input_ids"]) for enc in all_encodings]
+            sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+
+            processed_results = []
+
+            # Process model inference in batches
+            for i in range(0, len(sorted_indices), batch_size):
+                current_batch_size = min(batch_size, len(sorted_indices) - i)
+                batch_indices = sorted_indices[i : i + current_batch_size]
+
+                batch_items = [text_data[idx][1] for idx in batch_indices]
+                batch_positions = [text_data[idx][0] for idx in batch_indices]
+
+                # Get encodings for current batch
+                batch_encodings = [all_encodings[idx] for idx in batch_indices]
+
+                # Get the maximum length in this batch
+                current_length = max(len(enc["input_ids"]) for enc in batch_encodings)
+
+                # Reset buffers to zero
+                input_ids_buffer.zero_()
+                attention_mask_buffer.zero_()
+
+                # Fill the pre-allocated buffers
+                for j, enc in enumerate(batch_encodings):
+                    seq_len = len(enc["input_ids"])
+                    input_ids_buffer[j, :seq_len].copy_(
+                        torch.tensor(enc["input_ids"], dtype=torch.long, device=device)
+                    )
+                    attention_mask_buffer[j, :seq_len] = 1
+
+                # Use views of the buffers for the current batch
+                input_ids = input_ids_buffer[:current_batch_size, :current_length]
+                attention_mask = attention_mask_buffer[
+                    :current_batch_size, :current_length
+                ]
+
+                with torch.no_grad():
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    probabilities = sigmoid(outputs.logits)
+                    predicted_labels = (probabilities > 0.5).int()
+
+                for idx, (item_data, prob, pred_label, orig_pos) in enumerate(
+                    zip(batch_items, probabilities, predicted_labels, batch_positions)
+                ):
+                    processed_item = process_labels(
+                        item_data.copy(),
+                        prob,
+                        pred_label,
+                        labels_all,
+                        child_to_parent,
+                        label_to_index,
+                    )
+                    processed_results.append((orig_pos, processed_item))
+                    processed_count += 1
+
+                # Clear memory after each model inference batch
+                del outputs, probabilities, predicted_labels
+                torch.cuda.empty_cache()
+
+            # Sort by original position before yielding
+            processed_results.sort(key=lambda x: x[0])
+            yield processed_results
+
+            # Clear memory after processing each chunk
+            del all_encodings, text_data, texts
+            gc.collect()
+
+        if rank == 0 and processed_count % 1000 == 0:
+            print(f"GPU {rank}: Processed {processed_count} items")
+            # Print memory usage for debugging
+            print(
+                f"RAM Memory usage: {psutil.Process().memory_info().rss / 1024 / 1024:.2f} MB"
+            )
 
     print(f"GPU {rank}: Completed processing {processed_count} items")
 
